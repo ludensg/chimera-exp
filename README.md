@@ -10,7 +10,32 @@ Additionally, the Chimera framework used in these experiments is sourced from th
 The [utilities](./utilities/) directory only contains miscellaneous scripts used for particular tasks while working on this project.
 
 NOTE: This project also uses the NVidia's Apex library for training.
-## 1. Comprehensive Experiment Proposal
+
+## 1. Simple Preliminary Experiment - [test](./test/)
+
+### Objective
+To validate the basic functionality of Chimera by training a small neural network model on HiPerGator.
+
+### Experimental Setup
+- **Model:** A simple CNN for image classification.
+- **Dataset:** A small subset of CIFAR-10.
+- **Hardware Configuration:** A small number of GPUs.
+- **Chimera Configuration:** Focus on pipeline parallelism for a simple setup.
+
+### Metrics to Collect
+- Training Time, Throughput, Resource Utilization.
+
+### Procedure
+1. Setup the environment and prepare the model and dataset.
+2. Configure Chimera for pipeline parallelism.
+3. Execute the training and collect metrics.
+
+### Expected Outcomes
+- Successful training and reasonable model accuracy.
+- Insight into resource utilization and scalability.
+
+
+## 2. Comprehensive Experiment Proposal - [chimera-eval](./chimera-eval/)
 
 ### Objective
 To demonstrate the effectiveness and efficiency of Chimera's parallel processing capabilities, focusing specifically on its scalability, the utilization of bidirectional pipelines, and the performance of its hybrid parallelism strategy.
@@ -34,26 +59,3 @@ Compare throughput, training time, GPU utilization, and memory usage across conf
 
 ### Expected Outcomes
 Demonstrate Chimera's superior scalability, efficiency, and performance benefits over traditional methods.
-
-## 2. Simple Preliminary Experiment
-
-### Objective
-To validate the basic functionality of Chimera by training a small neural network model on HiPerGator.
-
-### Experimental Setup
-- **Model:** A simple CNN for image classification.
-- **Dataset:** A small subset of CIFAR-10.
-- **Hardware Configuration:** A small number of GPUs.
-- **Chimera Configuration:** Focus on pipeline parallelism for a simple setup.
-
-### Metrics to Collect
-- Training Time, Throughput, Resource Utilization.
-
-### Procedure
-1. Setup the environment and prepare the model and dataset.
-2. Configure Chimera for pipeline parallelism.
-3. Execute the training and collect metrics.
-
-### Expected Outcomes
-- Successful training and reasonable model accuracy.
-- Insight into resource utilization and scalability.
