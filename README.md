@@ -9,7 +9,9 @@ Additionally, the Chimera framework used in these experiments is sourced from th
 
 The [utilities](./utilities/) directory only contains miscellaneous scripts used for particular tasks while working on this project.
 
-NOTE: This project also uses the NVidia's Apex library for training.
+NOTES: 
+- This project also uses the NVidia's Apex library for training.
+- Home storage used for code, blue storage for I/O, see [plot_cuda_timeline.sh](./Chimera/scripts/plot_cuda_timeline.sh) and [prof_steps](./Chimera/scripts/prof_steps.sh) for details.
 
 ## 1. Simple Preliminary Experiment - [test](./test/)
 
