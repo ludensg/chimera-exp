@@ -1,0 +1,533 @@
+===== parse_nvtx_events.py =====
+
+import argparse
+import sqlite3
+import warnings
+import statistics
+import pickle
+
+import pandas as pd
+
+
+def get_all_event_texts():
+    sql = f"""
+    SELECT DISTINCT text
+    FROM NVTX_EVENTS;
+    """
+    df = pd.read_sql(sql, con)
+    return [row['text'] for _, row in df.iterrows()]
+
+
+def get_event_start_end(event_text):
+    sql = f"""
+    SELECT start, end
+    FROM NVTX_EVENTS
+    WHERE text = '{event_text}';
+    """
+    df = pd.read_sql(sql, con)
+    return [(row['start'], row['end']) for _, row in df.iterrows()]
+
+
+def get_total_time_in_event(target_table_name, event_start, event_end):
+    sql = f"""
+    SELECT SUM(target.end - target.start) AS total_time
+    FROM {target_table_name} target
+    INNER JOIN CUPTI_ACTIVITY_KIND_RUNTIME runtime
+      ON target.correlationId = runtime.correlationId
+    WHERE runtime.start BETWEEN {event_start} AND {event_end};
+    """
+    df = pd.read_sql(sql, con)
+    time = df['total_time'].iloc[0]
+    if time is None:
+        return 0
+    return time
+
+
+def get_start_end_in_event(target_table_name, event_start, event_end):
+    sql = f"""
+    SELECT MIN(target.start), MAX(target.end)
+    FROM {target_table_name} target
+    INNER JOIN CUPTI_ACTIVITY_KIND_RUNTIME runtime
+      ON target.correlationId = runtime.correlationId
+    WHERE runtime.start BETWEEN {event_start} AND {event_end};
+    """
+    df = pd.read_sql(sql, con)
+    start = df['MIN(target.start)'].iloc[0]
+    end = df['MAX(target.end)'].iloc[0]
+    return start, end
+
+
+def get_runtime_in_event(event_start, event_end):
+    return event_end - event_start
+
+
+def get_kernel_time_in_event(event_start, event_end):
+    return get_total_time_in_event('CUPTI_ACTIVITY_KIND_KERNEL', event_start, event_end)
+
+
+def get_kernel_start_end_in_event(event_start, event_end):
+    return get_start_end_in_event('CUPTI_ACTIVITY_KIND_KERNEL', event_start, event_end)
+
+
+def get_memset_time_in_event(event_start, event_end):
+    return get_total_time_in_event('CUPTI_ACTIVITY_KIND_MEMSET', event_start, event_end)
+
+
+def get_memcpy_time_in_event(event_start, event_end):
+    return get_total_time_in_event('CUPTI_ACTIVITY_KIND_MEMCPY', event_start, event_end)
+
+
+def get_sync_time_in_event(event_start, event_end):
+    return get_total_time_in_event('CUPTI_ACTIVITY_KIND_SYNCHRONIZATION', event_start, event_end)
+
+
+def get_stats(event_texts, pickle_path):
+    times = {'ncalls': []}
+    for key in ['runtime', 'kernel', 'memset', 'memcpy', 'sync']:
+        times[key] = []
+        times[f'{key}_stdev'] = []
+    index = []
+    print(f'Collecting time for {event_texts}')
+    for txt in event_texts:
+        event_start_end = get_event_start_end(txt)
+        if len(event_start_end) == 0:
+            continue
+        index.append(txt)
+        if args.ignore_first_event:
+            # ignore first NVTX event
+            event_start_end = event_start_end[1:]
+        times['ncalls'].append(len(event_start_end))
+        for key, f in {'runtime': get_runtime_in_event,
+                       'kernel': get_kernel_time_in_event,
+                       'memset': get_memset_time_in_event,
+                       'memcpy': get_memcpy_time_in_event,
+                       'sync': get_sync_time_in_event}.items():
+            _times = [f(s, e) / 10**6 for s, e in event_start_end]  # ns -> ms
+            mean = 0 if len(_times) < 1 else statistics.mean(_times)
+            times[key].append(mean)
+            stdev = 0 if len(_times) < 2 else statistics.stdev(_times)
+            times[f'{key}_stdev'].append(stdev)
+
+    df = pd.DataFrame(times, index=index)
+    print(df)
+    print(f'Writing results to "{pickle_path}"')
+    df.to_pickle(pickle_path)
+
+
+def get_kernel_timeline(main_event_text, sub_event_texts, pickle_path, main_event_indices=None):
+    main_event_start_end = get_event_start_end(main_event_text)
+    assert len(main_event_start_end) > 0, f'event {main_event_text} does not exist.'
+    if main_event_indices is None:
+        main_event_indices = [len(main_event_start_end) - 1]  # the last index
+    main_event_indices = sorted(main_event_indices)
+    print(main_event_start_end)
+    target_start_end = [main_event_start_end[i] for i in main_event_indices]
+    if main_event_text in sub_event_texts:
+        sub_event_texts.remove(main_event_text)
+    print(f'Collecting timeline for {sub_event_texts} in "{main_event_text}" event (indices:{main_event_indices})')
+    timeline = {'start_end': target_start_end}
+    print(timeline)
+    for txt in sub_event_texts:
+        event_start_end = get_event_start_end(txt)
+        if len(event_start_end) == 0:
+            continue
+        timeline[txt] = []
+        for s, e in event_start_end:
+            if any(start <= s and e <= end for start, end in target_start_end):
+                timeline[txt].append(get_kernel_start_end_in_event(s, e))
+        print(txt, len(timeline[txt]))
+
+    print(f'Writing results to "{pickle_path}"')
+    with open(pickle_path, 'wb') as f:
+        pickle.dump(timeline, f)
+
+
+def main():
+    if args.event_texts is None:
+        event_texts = get_all_event_texts()
+        event_texts = [t for t in event_texts if t is not None]
+        if args.event_keywords is not None:
+            event_keywords = args.event_keywords.split(',')
+            event_texts = [txt for txt in event_texts
+                           if any([kwd in txt for kwd in event_keywords])]
+    else:
+        event_texts = args.event_texts.split(',')
+        if args.event_keywords is not None:
+            warnings.warn('As event_texts is specified, event_keywords will be ignored.')
+
+    if args.pickle_path_stats is not None:
+        get_stats(event_texts, args.pickle_path_stats)
+
+    if args.pickle_path_timeline is not None:
+        if args.main_event_indices is not None:
+            main_event_indices = [int(s) for s in args.main_event_indices.split(',')]
+        else:
+            main_event_indices = []
+        get_kernel_timeline(args.main_event_text, event_texts, args.pickle_path_timeline, main_event_indices)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('sqlite_path', type=str)
+    parser.add_argument('--pickle_path_stats', type=str, default=None)
+    parser.add_argument('--pickle_path_timeline', type=str, default=None)
+    parser.add_argument('--ignore_first_event', action='store_true')
+    parser.add_argument('--event_texts', type=str)
+    parser.add_argument('--event_keywords', type=str)
+    parser.add_argument('--main_event_indices', type=str, default=None)
+    parser.add_argument('--main_event_text', type=str)
+    args = parser.parse_args()
+    con = sqlite3.connect(args.sqlite_path)
+    main()
+
+
+===== nsys_wrap.sh =====
+
+#!/bin/bash
+
+if [[ -z "${NSYS_OUTPUT}" ]]; then
+    NSYS_OUTPUT=prof
+fi
+if [[ -z "${NSYS_NODE_INTERVAL}" ]]; then
+    NSYS_NODE_INTERVAL=1
+fi
+if [ "${SLURM_LOCALID}" -eq 0 ] && [ "$(( SLURM_NODEID % NSYS_NODE_INTERVAL ))" -eq 0 ];
+then
+    nsys profile \
+        -f true \
+        -o ${NSYS_OUTPUT}_node${SLURM_NODEID} \
+        -c cudaProfilerApi \
+        --trace cuda,nvtx,cudnn,osrt \
+        --export sqlite \
+        $@
+else
+    $@
+fi
+sleep 30  # wait for nsys to complete
+
+
+===== prof_steps.sh =====
+
+#!/bin/bash -l
+#SBATCH -M swarm
+#SBATCH -p gpu
+#SBATCH --nodes=8
+#SBATCH --ntasks=8
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=4
+#SBATCH --time=00:05:00
+#SBATCH --output=interleave6.txt
+#SBATCH --partition=gpu
+
+
+module load nvidia/cuda/11.6
+conda init bash
+conda activate cjhpy39
+export MASTER_ADDR=$(hostname)
+
+#model=bert-base
+model=bert-large
+#pipeline='gpipe'
+#pipeline='1f1b'
+pipeline='chimera'
+#pipeline='interleave'
+stages=8
+ngpus=8
+microbs=32
+acc=1
+export NSYS_NODE_INTERVAL=$((ngpus/stages))
+mkdir -p /blue/gtyson.fsu/dg16r.fsu/chimera-data/bert_prof
+#export NSYS_OUTPUT=bert_prof/${model}_${pipeline}_${stages}stages_${ngpus}gpus_microbs${microbs}_acc${acc}
+export NSYS_OUTPUT=/blue/gtyson.fsu/dg16r.fsu/chimera-data/bert_prof/${model}_${pipeline}_${stages}stages_${ngpus}gpus_microbs${microbs}_acc${acc}
+
+srun --nodes=8 --ntasks=8 --ntasks-per-node=1 --cpus-per-task=4 --gres gpu:1 --wait=0  scripts/nsys_wrap.sh\
+    python main_bert.py \
+            --num_stages $stages \
+            --corpus_path /blue/gtyson.fsu/dg16r.fsu/chimera-data/bert_data/wikipedia.segmented.nltk.txt \
+            --vocab_path /blue/gtyson.fsu/dg16r.fsu/chimera-data/bert_data/bert-large-uncased-vocab.txt \
+            --corpus_lines 10000 \
+            --do_lower_case \
+            --bert_config_path ./configs/bert_config_${model}-uncased.json \
+            --max_seq_length 128 \
+            --micro_batch_size $microbs \
+            --num_optimization_steps 8 \
+            --gradient_accumulation_steps $acc \
+            --pipeline_method $pipeline \
+            --p2p_backend 'gloo' \
+            --collective_backend 'nccl' \
+            --profile \
+	        --chunks 2 \
+            --num_pipelines 2\
+
+
+===== plot_cuda_timeline.py =====
+
+import argparse
+import pickle
+from collections import OrderedDict
+import re
+import numpy as np
+import os
+
+os.environ['MPLCONFIGDIR'] = os.getcwd() + "/configs/"
+import matplotlib
+matplotlib.use('Agg')
+matplotlib.rcParams.update({'font.size': 20})
+import matplotlib.pyplot as plt
+from matplotlib.collections import PolyCollection
+
+
+key_to_color_label = OrderedDict(
+    {
+        'call_forward': ('C0', 'forward'),
+        'call_backward': ('C1', 'backward'),
+        'cov_kron_A': ('C2', 'curvature'),
+        'cov_kron_B': ('C2', None),
+        'cov_unit_wise': ('C2', None),
+        'inv_kron_A': ('C4', 'inverse'),
+        'inv_kron_B': ('C4', None),
+        'inv_unit_wise': ('C4', None),
+        'sync_grad': ('C7', 'sync-grad'),
+        'nb_sync_grad': ('C7', None),
+        'reduce_scatter_grad': ('C7', None),
+        'all_reduce_undivided_grad': ('C7', None),
+        'all_gather_grad': ('C7', None),
+        'all_reduce_no_curvature_grad': ('C7', None),
+        'reduce_curvature': ('C9', 'sync-curvature'),
+        'reduce_scatter_curvature': ('C9', 'sync-curvature'),
+        'all_reduce_undivided_curvature': ('C9', None),
+        'precondition': ('C8', 'precondition'),
+    }
+)
+
+
+def sort(array, num_split):
+    if num_split == 1:
+        return array
+    array_sorted = []
+    for i in range(num_split):
+        array_sorted += array[i:len(array):num_split]
+    return array_sorted
+
+
+def main():
+    fig = plt.figure(figsize=(20, 8))
+    gs = fig.add_gridspec(1, 1)
+    ax = fig.add_subplot(gs[0, 0])
+
+    min_time = timelines[0]['call_forward'][0][0]
+    max_time = 0
+    for start_end_list in timelines[0].values():
+        for s, e in start_end_list:
+            if e is not None:
+                max_time = max(max_time, e)
+
+    def time_shift(t):
+        return (t - min_time) / 10 ** 6  # ns -> ms
+
+    num_iterations = len(timelines[0]['start_end'])
+    num_forward_per_iteration = len(timelines[0]['call_forward']) // num_iterations
+    first_pipeline_time = time_shift(timelines[0]['call_forward'][num_forward_per_iteration][0])
+
+    verts = []
+    verts_alpha = []
+    colors = []
+    colors_alpha = []
+    used_keys = set()
+    width = .95
+    usages = []
+    for idx, timeline in enumerate(sort(timelines, args.num_replicas)):
+        total_time_in_first_pipeline = 0
+        y = len(timelines) - idx - 1
+        for i, event_txt in enumerate(timeline):
+            if not any(key in event_txt for key in key_to_color_label):
+                continue
+            key = next(key for key in key_to_color_label if key in event_txt)
+            used_keys.add(key)
+            start_end_list = timeline[event_txt]
+            for s, e in start_end_list:
+                if s is None or e is None:
+                    continue
+                s = time_shift(s)
+                e = time_shift(e)
+                if e < first_pipeline_time:
+                    total_time_in_first_pipeline += e - s
+                v = [(s, y-width/2), (s, y+width/2), (e, y+width/2), (e, y-width/2), (s, y-width/2)]
+                print(v, event_txt)
+                color, label = key_to_color_label[key]
+                if any(keyword in key for keyword in ['sync', 'reduce', 'gather']):
+                    verts_alpha.append(v)
+                    colors_alpha.append(color)
+                else:
+                    verts.append(v)
+                    colors.append(color)
+        usages.append(total_time_in_first_pipeline / first_pipeline_time)
+    usage = np.mean(usages)
+
+    bars = PolyCollection(verts, facecolors=colors)
+    ax.add_collection(bars)
+    bars = PolyCollection(verts_alpha, facecolors=colors_alpha, alpha=.5, hatch='//')
+    ax.add_collection(bars)
+    ax.autoscale()
+
+    ax.set_xlabel('Time (ms)')
+    ax.set_yticks(range(len(timelines)))
+    ax.set_yticklabels([f'GPU {i+1}' for i in range(len(timelines))][::-1])
+    ax.set_title(f'{args.title} [GPU util. {usage * 100:.1f}%]')
+    ax.set_xlim(time_shift(min_time), time_shift(max_time))
+
+    durations = []
+    prev_start = None
+    for i in range(1, num_iterations):
+        start_time = time_shift(timelines[0]['call_forward'][num_forward_per_iteration * i][0])
+        if prev_start is None:
+            durations.append(start_time)
+        else:
+            durations.append(start_time - prev_start)
+        prev_start = start_time
+        ax.axvline(start_time, color='r', lw=7, label='flush @ GPU1' if i == 1 else None)
+    print('avg duration', np.mean(durations))
+    for key, (color, label) in key_to_color_label.items():
+        if key in used_keys:
+            if any(keyword in key for keyword in ['sync', 'reduce', 'gather']):
+                ax.bar(0, 0, label=label, color=color, alpha=0.5, hatch='//')
+            else:
+                ax.bar(0, 0, label=label, color=color)
+#    if len(used_keys) + 1 > 6:
+#        ax.legend(bbox_to_anchor=(0, 1.2), loc='upper left', ncol=6)
+#    else:
+#        ax.legend(bbox_to_anchor=(0, 1.15), loc='upper left', ncol=len(used_keys)+1)
+
+    plt.tight_layout()
+    plt.savefig(args.fig_path, bbox_inches='tight')
+
+
+def tryint(s):
+    """
+    Return an int if possible, or `s` unchanged.
+    """
+    try:
+        return int(s)
+    except ValueError:
+        return s
+
+
+def alphanum_key(s):
+    """
+    Turn a string into a list of string and number chunks.
+
+    >>> alphanum_key("z23a")
+    ["z", 23, "a"]
+
+    """
+    return [tryint(c) for c in re.split('([0-9]+)', s)]
+
+
+def human_sort(l):
+    """
+    Sort a list in the way that humans expect.
+    """
+    l.sort(key=alphanum_key)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('pickle_paths', type=str)
+    parser.add_argument('--fig_path', type=str, default='prof.png')
+    parser.add_argument('--title', type=str, default=None)
+    parser.add_argument('--num_replicas', type=int, default=1)
+    args = parser.parse_args()
+
+    timelines = []
+    pickle_paths = args.pickle_paths.split(',')
+    human_sort(pickle_paths)
+    for pickle_path in pickle_paths:
+        if pickle_path == '':
+            continue
+        timelines.append(pickle.load(open(pickle_path, 'rb')))
+    main()
+
+
+===== concatenate.py =====
+
+import os
+
+# Define the output file name
+output_file_name = 'concatenated_code_files.txt'
+
+# Define the types of files to include, e.g., Python files only
+included_extensions = ['.py', '.sh']
+
+# Open the output file in write mode
+with open(output_file_name, 'w') as output_file:
+    # Iterate over each item in the current directory
+    for item in os.listdir('.'):
+        # Check if the item is a file and has an included extension
+        if os.path.isfile(item) and any(item.endswith(ext) for ext in included_extensions):
+            # Write a header for the file
+            output_file.write(f'===== {item} =====\n\n')
+            # Open and read the current file
+            with open(item, 'r') as input_file:
+                # Write the content of the file to the output file
+                output_file.write(input_file.read())
+                # Add a newline after the content for separation
+                output_file.write('\n\n')
+
+print(f"All code files have been concatenated into {output_file_name}.")
+
+
+===== plot_cuda_timeline.sh =====
+
+#!/bin/bash
+
+#model=bert-base
+model=bert-large
+#pipeline='gpipe'
+#pipeline='1f1b'
+pipeline='chimera'
+#pipeline='interleave'
+stages=8
+ngpus=8
+microbs=32
+acc=1
+
+base_dir=/blue/gtyson.fsu/dg16r.fsu/chimera-data/bert_prof
+mkdir -p ${base_dir} # This creates the bert_prof directory if it doesn't exist
+name=${model}_${pipeline}_${stages}stages_${ngpus}gpus_microbs${microbs}_acc${acc}
+main_event_text=call_pipeline
+
+sqlite_paths=$(find ${base_dir} -type f -name "${name}_node*.sqlite" | sort )
+
+for sqlite_path in $sqlite_paths
+do
+    pickle_path_timeline=${base_dir}/$(basename ${sqlite_path} | cut -f 1 -d '.' )_timeline.pickle
+    echo parse $sqlite_path
+    python scripts/parse_nvtx_events.py \
+        $sqlite_path \
+        --pickle_path_timeline $pickle_path_timeline \
+        --ignore_first_event \
+        --main_event_indices '5,6,7' \
+        --event_keywords call_forward,call_backward,cov_kron_A,cov_kron_B,inv_kron_A,inv_kron_B,precondition,reduce,gather,sync \
+        --main_event_text $main_event_text
+    rm -f $sqlite_path
+    nsys_path=${base_dir}/$(basename ${sqlite_path} | cut -f 1 -d '.' ).nsys-rep
+    rm -f $nsys_path
+done
+pickle_paths=""
+for pickle_path in $(find ${base_dir} -type f -name "${name}_node*_timeline.pickle" | sort )
+do
+    pickle_paths+="${pickle_path},"
+done
+fig_path=${base_dir}/${name}.pdf
+echo creating ${fig_path} ...
+echo "${name}_node*_timeline.pickle"
+python scripts/plot_cuda_timeline.py \
+    $pickle_paths \
+    --fig_path $fig_path \
+    --title $name \
+    --num_replicas 1 \
+    >> plot_cuda_time.txt
+#imgcat $fig_path
+
+
