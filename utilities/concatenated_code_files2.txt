@@ -1,0 +1,3047 @@
+===== main_bert_simple.py =====
+
+import argparse
+import os
+import random
+import math
+from contextlib import nullcontext
+
+import yaml
+
+import numpy as np
+import torch
+from torch import nn
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.nn.utils import parameters_to_vector, vector_to_parameters
+
+from transformers import BertTokenizer, BertConfig, BertLayer
+
+from utils import init_dist_process_group
+from bert_optim import BertAdam
+from bert_dataset import BERTDataset
+from bert_optim import PolyWarmUpScheduler
+from bert_model import BertForPreTrainingEx
+
+from apex.optimizers import FusedLAMB
+import transformers
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
+parser = argparse.ArgumentParser()
+# Dataset & BERT
+parser.add_argument("--corpus_path", default=None, type=str, required=True,
+                    help="The input train corpus.")
+parser.add_argument('--corpus_lines', default=None, type=int)
+parser.add_argument("--vocab_path", type=str, required=True)
+parser.add_argument("--on_memory", action='store_true',
+                    help="Whether to load train samples into memory or use disk")
+parser.add_argument("--do_lower_case", action='store_true',
+                    help="Whether to lower case the input text. True for uncased models, False for cased models.")
+parser.add_argument("--bert_config_path", type=str, required=True,
+                    help="config to use.")
+parser.add_argument("--max_seq_length", default=128, type=int,
+                    help="The maximum total input sequence length after WordPiece tokenization. \n"
+                         "Sequences longer than this will be truncated, and sequences shorter \n"
+                         "than this will be padded.")
+# Training
+parser.add_argument("--batch_size", default=32, type=int,
+                    help="Batch size for training.")
+parser.add_argument('--num_optimization_steps', default=None, type=int,
+                    help="Total number of optimization steps to perform.")
+parser.add_argument("--num_epochs", default=None, type=int,
+                    help="Total number of training epochs to perform.")
+parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
+                    help="Number of updates steps to accumulate before performing a backward/update pass.")
+parser.add_argument("--learning_rate", default=3e-5, type=float,
+                    help="The initial learning rate for Adam.")
+parser.add_argument("--momentum", default=0.9, type=float)
+
+
+parser.add_argument("--max_grad_norm", type=float, default=1.)
+
+parser.add_argument("--weight_decay", type=float, default=0.01)
+parser.add_argument("--beta1", type=float, default=0.9)
+parser.add_argument("--beta2", type=float, default=0.999)
+parser.add_argument("--warmup_proportion", default=0.1, type=float,
+                    help="Proportion of training to perform linear learning rate warmup for.")
+parser.add_argument("--damping", type=float, default=0.01)
+parser.add_argument("--inv_interval", type=int, default=1)
+parser.add_argument('--weight_scaling', action='store_true')
+parser.add_argument('--lars', action='store_true')
+parser.add_argument('--adam', action='store_true')
+parser.add_argument('--sgd', action='store_true')
+# Others
+parser.add_argument('--checkpoint_dir', default=None, type=str,
+                    help='path to directory to save checkpoints')
+parser.add_argument('--save_checkpoint_steps', type=int, default=200)
+parser.add_argument('--resume', type=str, default=None)
+parser.add_argument('--seed', type=int, default=1,
+                    help="random seed for initialization")
+parser.add_argument('--collective_backend',
+                    default=dist.Backend.NCCL, type=str)
+parser.add_argument('--num_workers', default=4, type=int)
+parser.add_argument('--profile', action='store_true')
+parser.add_argument('--observe_norm', action='store_true')
+parser.add_argument('--log_interval', type=int, default=100)
+parser.add_argument('--config', type=str, default=None)
+parser.add_argument('--subset_size', type=int, default=None)
+parser.add_argument('--wandb', action='store_true')
+
+
+def main():
+    total_steps = 0
+    for epoch in range(num_epochs):
+        if is_distributed:
+            dist.barrier()
+            # deterministically shuffle based on epoch
+            train_loader.sampler.set_epoch(epoch)
+
+        steps_for_this_epoch = min(
+            num_steps - total_steps, max_steps_per_epoch)
+        train_one_epoch(epoch, total_steps, steps_for_this_epoch)
+        total_steps += steps_for_this_epoch
+
+    if is_master:
+        if args.checkpoint_dir is not None:
+            save_checkpoint(num_epochs, num_steps)
+        print('Finished.')
+
+
+def train_one_epoch(epoch, step, num_steps_for_this_epoch):
+    train_iterator = iter(train_loader)
+    after_reset = False
+
+    for i in range(num_steps_for_this_epoch):
+        if not args.adam:
+            for lr_scheduler in lr_schedulers:
+                lr_scheduler.step()
+        for optim in optimizers:
+            optim.zero_grad()
+
+        total_loss = 0
+        total_masked_lm_loss = 0
+        total_next_sentence_loss = 0
+        for j in range(grad_acc_steps):
+            inputs = next(train_iterator)
+            for key in inputs:
+                inputs[key] = inputs[key].to(device)
+            cov_cxt = nullcontext()
+            with cov_cxt as cxt:
+                outputs = model(**inputs)
+                total_loss += float(outputs['loss']) / \
+                    num_micro_batches_per_step
+                total_masked_lm_loss += float(
+                    outputs['masked_lm_loss']) / num_micro_batches_per_step
+                total_next_sentence_loss += float(
+                    outputs['next_sentence_loss']) / num_micro_batches_per_step
+                loss = outputs['loss']
+                loss /= num_micro_batches_per_step
+                no_sync_if_needed = model.no_sync() \
+                    if isinstance(model, DDP) and j < grad_acc_steps - 1 \
+                    else nullcontext()
+                with no_sync_if_needed:
+                    loss.backward()
+
+        for optim in optimizers:
+            optim.step()
+            if not isinstance(optim, FusedLAMB):
+                for pg in optim.param_groups:
+                    pg['step'] += 1
+
+        if is_distributed:
+            total_loss = torch.tensor(total_loss).to(device)
+            total_masked_lm_loss = torch.tensor(
+                total_masked_lm_loss).to(device)
+            total_next_sentence_loss = torch.tensor(
+                total_next_sentence_loss).to(device)
+            dist.reduce(total_loss, dst=0)
+            dist.reduce(total_masked_lm_loss, dst=0)
+            dist.reduce(total_next_sentence_loss, dst=0)
+
+        if (step+i) % args.log_interval == 0:
+            if is_master:
+                print(f"epoch{epoch+1} step{step+i+1} loss = {float(total_loss)} "
+                      f"({float(total_masked_lm_loss)} + {float(total_next_sentence_loss)})", flush=True)
+                if args.wandb:
+                    lr = optimizers[0].param_groups[0]['lr']
+                    log = {'epoch': epoch+1, 'step': step+i+1,
+                           'loss': float(total_loss),
+                           'masked_lm_loss': float(total_masked_lm_loss),
+                           'next_sentence_loss': float(total_next_sentence_loss),
+                           'learning_rate': lr}
+                    if args.observe_norm:
+                        log['p_norm'] = np.sqrt(
+                            sum([float(p.data.norm()) ** 2 for p in model.parameters()]))
+                        log['g_norm'] = np.sqrt(sum(
+                            [float(p.grad.norm()) ** 2 for p in model.parameters() if p.grad is not None]))
+                        for pname, p in model.named_parameters():
+                            log[f'{pname}_p_norm'] = p.norm()
+                            log[f'{pname}_g_norm'] = p.grad.norm()
+                    wandb.log(log)
+
+        if args.checkpoint_dir is not None and (step+i+1) % args.save_checkpoint_steps == 0 and is_master:
+            save_checkpoint(epoch, step+i+1)
+
+
+def save_checkpoint(epoch, step):
+    state = {
+        'epoch': epoch + 1,
+        'step': step,
+        'model': model.module.state_dict() if isinstance(model, DDP) else model.state_dict(),
+        'optimizer': optimizers[0].state_dict()
+    }
+
+    assert os.path.isdir(args.checkpoint_dir)
+    ckpt_file_path = os.path.join(
+        args.checkpoint_dir, f'epoch{epoch+1}_step{step}.pt')
+    torch.save(state, ckpt_file_path)
+    print(f'Saved checkpoint to {ckpt_file_path}', flush=True)
+    global prev_prev_checkpoint_path, prev_checkpoint_path
+    prev_prev_checkpoint_path = prev_checkpoint_path
+    prev_checkpoint_path = ckpt_file_path
+
+
+if __name__ == "__main__":
+    args = parser.parse_args()
+    dict_args = vars(args)
+    if args.config is not None:
+        dict_args.update(yaml.safe_load(open(args.config, 'r')))
+
+    # Setup rank and device
+    local_rank, local_size, rank, world_size = init_dist_process_group(
+        backend=args.collective_backend)
+    assert local_size <= torch.cuda.device_count()
+    torch.cuda.set_device(local_rank)
+    device = torch.cuda.current_device()
+    is_master = rank == 0
+
+    # Set random seed
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
+
+    is_distributed = world_size > 1
+
+    # Prepare BERT model
+    bert_config = BertConfig.from_json_file(args.bert_config_path)
+    model = BertForPreTrainingEx(config=bert_config).to(device)
+    checkpoint = None
+    if args.resume is not None:
+        checkpoint = torch.load(args.resume)
+        model.load_state_dict(checkpoint['model'])
+    elif is_distributed:
+        packed_tensor = parameters_to_vector(model.parameters())
+        dist.broadcast(packed_tensor, src=0)
+        vector_to_parameters(packed_tensor, model.parameters())
+    if is_distributed:
+        model = DDP(model)
+    
+    # Prepare BERT dataset
+    batch_size = args.batch_size
+    max_seq_length = args.max_seq_length
+    num_tokens = batch_size * max_seq_length
+    assert batch_size % world_size == 0
+    local_batch_size = batch_size // world_size
+    grad_acc_steps = args.gradient_accumulation_steps
+    assert local_batch_size % grad_acc_steps == 0
+    micro_batch_size = local_batch_size // grad_acc_steps
+    tokenizer = BertTokenizer(
+        args.vocab_path, do_lower_case=args.do_lower_case)
+    train_dataset = BERTDataset(args.corpus_path,
+                                tokenizer,
+                                seq_len=max_seq_length,
+                                corpus_lines=args.corpus_lines,
+                                encoding='latin-1',
+                                on_memory=args.on_memory)
+
+    if args.subset_size is not None:
+        train_dataset = torch.utils.data.Subset(
+            train_dataset, range(args.subset_size))
+
+    sampler = None
+    if world_size > 1:
+        sampler = DistributedSampler(
+            train_dataset, num_replicas=world_size, rank=rank)
+    train_loader = DataLoader(train_dataset,
+                              sampler=sampler,
+                              batch_size=micro_batch_size,
+                              drop_last=True,
+                              num_workers=args.num_workers)
+
+    # Set the number of optimization steps and epochs
+    num_micro_batches_per_step = world_size * grad_acc_steps
+    max_steps_per_epoch = len(train_dataset) // batch_size
+    num_steps = args.num_optimization_steps
+    if num_steps is None:
+        assert args.num_epochs, 'num_optimization_steps or num_epochs needs to be specified.'
+        num_epochs = args.num_epochs
+        num_steps = max_steps_per_epoch * args.num_epochs
+    else:
+        total_num_samples = num_steps * batch_size
+        num_epochs = math.ceil(total_num_samples / len(train_dataset))
+
+    decay_param_group = {'params': [], 'weight_decay': args.weight_decay}
+    no_decay_param_group = {'params': [], 'weight_decay': 0.}
+    if args.weight_scaling:
+        no_decay_param_group['weight_scaling'] = False
+    for name, m in model.named_modules():
+        if 'word_embeddings' in name:
+            continue
+        if isinstance(m, nn.LayerNorm):
+
+            no_decay_param_group['params'] += list(m.parameters())
+        elif isinstance(m, (nn.Linear, nn.Embedding)):
+            if hasattr(m, 'bias') and m.bias is not None:
+
+                no_decay_param_group['params'].append(m.bias)
+
+            decay_param_group['params'].append(m.weight)
+    optimizers = []
+    lr_schedulers = []
+    if args.adam:
+        params = [decay_param_group, no_decay_param_group]
+
+        optimizer = BertAdam(params,
+                             lr=args.learning_rate,
+                             warmup=args.warmup_proportion,
+                             t_total=num_steps,
+                             b1=args.beta1,
+                             b2=args.beta2,
+                             max_grad_norm=args.max_grad_norm,
+                             weight_scaling=args.weight_scaling,
+                             lars=args.lars)
+        for pg in optimizer.param_groups:
+            pg['step'] = 0
+        lr_schedulers.append(PolyWarmUpScheduler(optimizer,
+                                                 warmup=args.warmup_proportion,
+                                                 total_steps=num_steps,
+                                                 base_lr=args.learning_rate,
+                                                 device=device))
+        optimizers.append(optimizer)
+    else:
+        if args.sgd:
+            optimizer = torch.optim.SGD([decay_param_group, no_decay_param_group],
+                                        lr=args.learning_rate,
+                                        momentum=args.momentum)
+            for pg in optimizer.param_groups:
+                pg['step'] = 0
+        else:
+            optimizer = FusedLAMB(
+                [decay_param_group, no_decay_param_group], lr=args.learning_rate)
+        lr_schedulers.append(PolyWarmUpScheduler(optimizer,
+                                                 warmup=args.warmup_proportion,
+                                                 total_steps=num_steps,
+                                                 base_lr=args.learning_rate,
+                                                 device=device))
+        optimizers.append(optimizer)
+
+    if checkpoint is not None:
+        for group in checkpoint['optimizer']['param_groups']:
+            group['step'] = 0
+            group['lr'] = args.learning_rate
+        optimizers[0].load_state_dict(checkpoint['optimizer'])
+
+    unused_keys = []
+
+    unused_keys.extend(['damping', 'inv_interval'])
+    if not args.adam:
+        unused_keys.extend(['beta1', 'beta2'])
+    for key in unused_keys:
+        dict_args.pop(key)
+
+    prev_prev_checkpoint_path = prev_checkpoint_path = None
+    prev_checkpoint_loss = None
+    if is_distributed:
+        dist.barrier()
+    if is_master:
+        if args.wandb:
+            wandb.init(entity=os.getenv('WANDB_ENTITY'),
+                       project=os.getenv('WANDB_PROJECT'),
+                       settings=wandb.Settings(start_method="thread"))
+            wandb.config.update(dict_args)
+        print('============================')
+        print(f'num_epochs: {num_epochs}')
+        print(f'num_optimization_steps: {num_steps}')
+        print(f'world_size: {world_size}')
+        print('----------------------------')
+        for key, value in dict_args.items():
+            print(f'{key}: {value}')
+        print('============================')
+
+    if args.profile:
+        with torch.cuda.profiler.profile():
+            main()
+    else:
+        main()
+
+
+===== bert_model.py =====
+
+from typing import List
+from collections import OrderedDict
+import copy
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
+import torch
+from torch.nn import CrossEntropyLoss
+from transformers.modeling_utils import ModuleUtilsMixin, ModelOutput
+from transformers.models.bert import BertConfig, BertForPreTraining, BertModel, BertPreTrainedModel
+from pipeline import StageModule
+
+# prepare a minimum size dummy model for extracting Module classes
+dummy_config = BertConfig.from_dict({
+    'hidden_size': 1,
+    'num_attention_heads': 1,
+    'num_hidden_layers': 1,
+    'vocab_size': 1,
+    'intermediate_size': 1,
+    'max_position_embeddings': 1,
+})
+dummy_model = BertForPreTraining(dummy_config)
+BertEncoder = dummy_model.bert.encoder.__class__
+BertPooler = dummy_model.bert.pooler.__class__
+BertPreTrainingHeads = dummy_model.cls.__class__
+
+
+def get_stage_bert_for_pretraining(stage_id: int,
+                                   num_stages: int,
+                                   config: BertConfig,
+                                   hidden_layers_assignments: List[int] = None,
+                                   loss_reduction='mean') -> StageModule:
+    """
+    start_stage (stage_id == 0): BertEmbeddings + [BertLayer] * N_s
+    intermediate_stage (0 < stage_id < num_stages - 1): [BertLayer] * N_i
+    end_stage (stage_id == num_stages - 1): [BertLayer] * N_e + BertPreTrainingHeads
+
+    N_s, N_i, N_e: the number of hidden layers (BertLayers) for each stage
+    """
+    assert num_stages > 1, 'At least 2 stages are required.'
+    if hidden_layers_assignments is None:
+        """
+        Assign the number of hidden layers (BertLayers) so that
+        the following are satisfied: 
+            N_e <= N_s <= N_i
+        """
+        hidden_layers_assignments = [0] * num_stages
+        for i in range(config.num_hidden_layers):
+            hidden_layers_assignments[-((i + 2) % num_stages)] += 1
+    assert len(hidden_layers_assignments) == num_stages
+    assert stage_id in range(num_stages)
+    # overwrite num_hidden_layers with the number for this stage
+    config = copy.deepcopy(config)
+    config.num_hidden_layers = hidden_layers_assignments[stage_id]
+
+    if stage_id == 0:
+        return StartingStage(config)
+    elif stage_id == num_stages - 1:
+        return EndingStage(config, loss_reduction=loss_reduction)
+    else:
+        return IntermediateStage(config)
+
+
+class StartingStage(BertModel, StageModule):
+    def __init__(self, config):
+        super().__init__(config, add_pooling_layer=False)
+
+    def forward(self, input_ids, attention_mask, token_type_ids):
+        outputs = super().forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            return_dict=True
+        )
+        return OrderedDict(hidden_states=outputs.last_hidden_state)
+
+    @property
+    def keys_from_source(self):
+        return ['input_ids', 'attention_mask', 'token_type_ids']
+
+    @property
+    def sizes_from_prev_stage(self):
+        return {}
+
+    @property
+    def sizes_for_next_stage(self):
+        return {'hidden_states': (self.config.hidden_size,)}
+
+
+class IntermediateStage(BertPreTrainedModel, StageModule, ModuleUtilsMixin):
+    def __init__(self, config):
+        super().__init__(config)
+        self.encoder = BertEncoder(config)
+        self.post_init()
+
+    def forward(self, hidden_states, attention_mask):
+        extended_attention_mask = self.get_extended_attention_mask(attention_mask,
+                                                                   hidden_states.size()[:-1],
+                                                                   hidden_states.device)
+        outputs = self.encoder.forward(
+            hidden_states=hidden_states,
+            attention_mask=extended_attention_mask,
+            return_dict=True
+        )
+        return OrderedDict(hidden_states=outputs.last_hidden_state)
+
+    @property
+    def keys_from_source(self):
+        return ['attention_mask']
+
+    @property
+    def sizes_from_prev_stage(self):
+        return {'hidden_states': (self.config.hidden_size,)}
+
+    @property
+    def sizes_for_next_stage(self):
+        return {'hidden_states': (self.config.hidden_size,)}
+
+
+class EndingStage(BertPreTrainedModel, StageModule, ModuleUtilsMixin):
+    def __init__(self, config, loss_reduction='mean'):
+        super().__init__(config)
+        self.encoder = BertEncoder(config)
+        self.pooler = BertPooler(config)
+        self.cls = BertPreTrainingHeads(config)
+        self.post_init()
+        self.loss_reduction = loss_reduction
+
+    def forward(self, hidden_states, attention_mask, labels, next_sentence_label):
+        extended_attention_mask = self.get_extended_attention_mask(attention_mask,
+                                                                   hidden_states.size()[:-1],
+                                                                   hidden_states.device)
+        encoder_outputs = self.encoder(hidden_states, extended_attention_mask)
+        sequence_output = encoder_outputs[0]
+        pooled_output = self.pooler(sequence_output)
+        prediction_scores, seq_relationship_score = self.cls(sequence_output, pooled_output)
+        loss_fct = CrossEntropyLoss(reduction=self.loss_reduction)
+        masked_lm_loss = loss_fct(prediction_scores.view(-1, self.config.vocab_size), labels.view(-1))
+        next_sentence_loss = loss_fct(seq_relationship_score.view(-1, 2), next_sentence_label.view(-1))
+        total_loss = masked_lm_loss + next_sentence_loss
+        return OrderedDict(loss=total_loss)
+
+    @property
+    def keys_from_source(self):
+        return ['attention_mask', 'labels', 'next_sentence_label']
+
+    @property
+    def sizes_from_prev_stage(self):
+        return {'hidden_states': (self.config.hidden_size,)}
+
+    @property
+    def sizes_for_next_stage(self):
+        return {}
+
+
+@dataclass
+class BertForPreTrainingOutput(ModelOutput):
+    """
+    Output type of [`BertForPreTraining`].
+
+    Args:
+        loss (*optional*, returned when `labels` is provided, `torch.FloatTensor` of shape `(1,)`):
+            Total loss as the sum of the masked language modeling loss and the next sequence prediction
+            (classification) loss.
+        prediction_logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
+            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+        seq_relationship_logits (`torch.FloatTensor` of shape `(batch_size, 2)`):
+            Prediction scores of the next sequence prediction (classification) head (scores of True/False continuation
+            before SoftMax).
+        hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
+            Tuple of `torch.FloatTensor` (one for the output of the embeddings + one for the output of each layer) of
+            shape `(batch_size, sequence_length, hidden_size)`.
+
+            Hidden-states of the model at the output of each layer plus the initial embedding outputs.
+        attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
+            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+            sequence_length)`.
+
+            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
+            heads.
+    """
+
+    loss: Optional[torch.FloatTensor] = None
+    masked_lm_loss: Optional[torch.FloatTensor] = None
+    next_sentence_loss: Optional[torch.FloatTensor] = None
+    prediction_logits: torch.FloatTensor = None
+    seq_relationship_logits: torch.FloatTensor = None
+    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    attentions: Optional[Tuple[torch.FloatTensor]] = None
+
+
+class BertForPreTrainingEx(BertForPreTraining):
+
+    def forward(
+            self,
+            input_ids=None,
+            attention_mask=None,
+            token_type_ids=None,
+            position_ids=None,
+            head_mask=None,
+            inputs_embeds=None,
+            labels=None,
+            next_sentence_label=None,
+            output_attentions=None,
+            output_hidden_states=None,
+            return_dict=None,
+    ):
+        r"""
+            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+                Labels for computing the masked language modeling loss. Indices should be in `[-100, 0, ...,
+                config.vocab_size]` (see `input_ids` docstring) Tokens with indices set to `-100` are ignored (masked),
+                the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`
+            next_sentence_label (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+                Labels for computing the next sequence prediction (classification) loss. Input should be a sequence
+                pair (see `input_ids` docstring) Indices should be in `[0, 1]`:
+
+                - 0 indicates sequence B is a continuation of sequence A,
+                - 1 indicates sequence B is a random sequence.
+            kwargs (`Dict[str, any]`, optional, defaults to *{}*):
+                Used to hide legacy arguments that have been deprecated.
+
+        Returns:
+
+        Example:
+
+        ```python
+        >>> from transformers import BertTokenizer, BertForPreTraining
+        >>> import torch
+
+        >>> tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+        >>> model = BertForPreTraining.from_pretrained("bert-base-uncased")
+
+        >>> inputs = tokenizer("Hello, my dog is cute", return_tensors="pt")
+        >>> outputs = model(**inputs)
+
+        >>> prediction_logits = outputs.prediction_logits
+        >>> seq_relationship_logits = outputs.seq_relationship_logits
+        ```
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.bert(
+            input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        sequence_output, pooled_output = outputs[:2]
+        prediction_scores, seq_relationship_score = self.cls(sequence_output, pooled_output)
+
+        total_loss = None
+        masked_lm_loss = None
+        next_sentence_loss = None
+        if labels is not None and next_sentence_label is not None:
+            loss_fct = CrossEntropyLoss()
+            masked_lm_loss = loss_fct(prediction_scores.view(-1, self.config.vocab_size), labels.view(-1))
+            next_sentence_loss = loss_fct(seq_relationship_score.view(-1, 2), next_sentence_label.view(-1))
+            total_loss = masked_lm_loss + next_sentence_loss
+
+        if not return_dict:
+            output = (prediction_scores, seq_relationship_score) + outputs[2:]
+            return ((total_loss,) + output) if total_loss is not None else output
+
+        return BertForPreTrainingOutput(
+            loss=total_loss,
+            masked_lm_loss=masked_lm_loss,
+            next_sentence_loss=next_sentence_loss,
+            prediction_logits=prediction_scores,
+            seq_relationship_logits=seq_relationship_score,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
+
+
+===== auto_schedule.py =====
+
+import argparse
+import pickle
+import copy
+import re
+
+
+PIPELINE_START = '-- start --'
+PIPELINE_END = '-- end --'
+FORWARD = 'call_forward'
+BACKWARD = 'call_backward'
+COV_KRON_A = 'cov_kron_A'
+COV_KRON_B = 'cov_kron_B'
+INV_KRON_A = 'inv_kron_A'
+INV_KRON_B = 'inv_kron_B'
+SYNC_KRON_A = 'sync_kron_A'
+SYNC_KRON_B = 'sync_kron_B'
+SYNC_GRAD = 'sync_grad'
+NB_SYNC_GRAD = 'nb_sync_grad'
+SYNC_CURVATURE = 'sync_curvature'
+SYNC_GRAD_PRE_PRECOND = 'sync_grad_pre_precondition'
+SYNC_GRAD_POST_PRECOND = 'sync_grad_post_precondition'
+WAIT_ALL = 'wait_all'
+BUBBLE = 'bubble'
+TURN_ON_SAVE = 'turn_on_save_inputs_outgrads'
+TURN_OFF_SAVE = 'turn_off_save_inputs_outgrads'
+
+TAG_UP_PIPE = ':up_pipe'
+
+
+pipeline_events = [FORWARD, BACKWARD]
+cov_events = [COV_KRON_A, COV_KRON_B]
+ngd_events = [COV_KRON_A, COV_KRON_B, SYNC_KRON_A,
+              SYNC_KRON_B, INV_KRON_A, INV_KRON_B]
+
+
+class Workload:
+    def __init__(self, label, start, end, priority=-1):
+        self.label = label
+        self.start = start
+        self.end = end
+        self.priority = priority
+
+    def __repr__(self):
+        return repr((self.label, self.start, self.end, self.duration))
+
+    @property
+    def duration(self):
+        return self.end - self.start
+
+
+class WorkloadQueue(Workload):
+    def __init__(self, label, start, end, queue_size, priority=-1):
+        super(WorkloadQueue, self).__init__(label, start, end, priority)
+        avg_duration = (end - start) // queue_size
+        workloads = []
+        s = start
+        # Add to the queue
+        for i in range(queue_size):
+            e = s + avg_duration
+            workloads.append(Workload(label, s, e, priority))
+            s = e
+        self.queue = workloads
+        self.avg_duration = avg_duration
+        self.next_workload_id = 0
+
+    def __repr__(self):
+        return repr((self.label, self.start, self.end, self.duration, f'queue_size={len(self)}'))
+
+    def pop(self):
+        assert len(self.queue) > 0
+        res = self.queue.pop(0)
+        if len(self.queue) == 0:
+            self.next_workload_id = None
+        else:
+            self.next_workload_id += 1
+        return res
+
+    def __len__(self):
+        return len(self.queue)
+
+
+def assign_workloads_to_bubbles(workloads, schedule, fwd_count=0, bwd_count=0, margin_ratio=.05):
+    new_schedule = []
+    last_workload = schedule.pop(0)
+    new_schedule.append(last_workload)
+    while len(schedule) > 0:
+        if last_workload.label == FORWARD:
+            fwd_count += 1
+        elif last_workload.label == BACKWARD:
+            bwd_count += 1
+        next_workload = schedule.pop(0)
+        # The time difference between the end of the previous step and the beginning of the next step is the bubble        bubble_start = last_workload.end
+        bubble_end = next_workload.start
+        while True:
+            # The pipeline that has been sent in, used to judge whether the number of new timetable elements does not change anymore after the loop
+            num_workloads_before = len(new_schedule)
+            for workload in workloads:
+                if isinstance(workload, WorkloadQueue):
+                    while bubble_start + workload.avg_duration * (1 + margin_ratio) < bubble_end:
+                        # fwd_count and next_workload_id are incremented together; if fwd_count < workload.next_workload_id + 1, then the forward pass has ended, and the same applies for the backward pass
+                        if COV_KRON_A in workload.label and (fwd_count < workload.next_workload_id + 1):
+                            break
+                        elif COV_KRON_B in workload.label and (bwd_count < workload.next_workload_id + 1):
+                            break
+                        # Take out the first workload
+                        sub_workload = workload.pop()
+                        sub_workload.end = bubble_start + sub_workload.duration
+                        sub_workload.start = bubble_start
+                        new_schedule.append(sub_workload)
+                        bubble_start += sub_workload.duration
+                        if len(workload) == 0:
+                            # There are no workloads in the current workloadQueue
+                            workloads.remove(workload)
+                            break
+                elif bubble_start + workload.duration * (1 + margin_ratio) < bubble_end:
+                    if SYNC_KRON_A in workload.label and any(COV_KRON_A in w.label for w in workloads):
+                        continue
+                    elif SYNC_KRON_B in workload.label and any(COV_KRON_B in w.label for w in workloads):
+                        continue
+                    elif INV_KRON_A in workload.label and any(COV_KRON_A in w.label or SYNC_KRON_A in w.label for w in workloads):
+                        continue
+                    elif INV_KRON_B in workload.label and any(COV_KRON_B in w.label or SYNC_KRON_B in w.label for w in workloads):
+                        continue
+                    workload.end = bubble_start + workload.duration
+                    workload.start = bubble_start
+                    new_schedule.append(workload)
+                    bubble_start += workload.duration
+                    workloads.remove(workload)
+            if len(new_schedule) == num_workloads_before:
+                # loop until no workload is added
+                break
+        new_schedule.append(next_workload)
+        last_workload = next_workload
+    return new_schedule
+
+
+def main():
+    # get start and end time by the timeline of the node 0
+    base_time = timelines[0]['call_forward'][0][0]
+    """
+    # The structure of the timeline:
+    {
+        "call_forward":[
+            [1,2],      # The front is the start time, the back is the end time
+            [2,3],
+            [3,4]
+        ],
+    }
+
+    """
+    if 'call_forward' + TAG_UP_PIPE in timelines[0]:
+        base_time = min(
+            base_time, timelines[0]['call_forward' + TAG_UP_PIPE][0][0])
+
+    def time_shift(t):
+        if t is None:
+            return 0
+        return t - base_time
+
+    start_time = 0
+    end_time = timelines[0]['call_backward'][-1][-1]
+    if 'call_backward' + TAG_UP_PIPE in timelines[0]:
+        end_time = max(
+            end_time, timelines[0]['call_backward' + TAG_UP_PIPE][-1][-1])
+    end_time = time_shift(end_time)
+    pipeline_time = end_time - start_time
+
+    schedules = []
+    num_pipeline_iterations_list = []
+    for node_id, timeline in enumerate(timelines):
+        pipeline_workloads = [Workload(PIPELINE_START, start_time, start_time)]
+        for event in pipeline_events:
+            for key in timeline:
+                if event not in key:
+                    continue
+                for s, e in timeline[key]:
+                    pipeline_workloads.append(
+                        Workload(key, time_shift(s), time_shift(e)))
+
+        pipeline_workloads.append(Workload(PIPELINE_END, end_time, end_time))
+        pipeline_workloads.sort(key=lambda x: x.start)
+
+        num_micro_batches = sum(
+            map(lambda x: x.label == FORWARD, pipeline_workloads))
+        """Calculate the number of forward micro-batches, while also judging whether it is the same as the number of backward batches."""
+        assert num_micro_batches == sum(
+            map(lambda x: x.label == BACKWARD, pipeline_workloads))
+
+        ngd_workloads = []
+        for i, event in enumerate(ngd_events):
+            for key in timeline:
+                if event not in key:
+                    continue
+                if event in cov_events:
+                    #  Distribute K-FAC into the bubbles
+                    for s, e in timeline[key]:
+                        #  Divide the start and end time into num_micro_batches workloads
+                        ngd_workloads.append(WorkloadQueue(key, time_shift(
+                            s), time_shift(e), num_micro_batches, priority=i))
+                else:
+                    for s, e in timeline[key]:
+                        ngd_workloads.append(
+                            Workload(key, time_shift(s), time_shift(e), priority=i))
+        # Now sort by start time, then by priority
+        ngd_workloads.sort(key=lambda x: x.start)
+        ngd_workloads.sort(key=lambda x: x.priority)
+
+        # assign as many workloads as possible to the 1st pipeline
+        schedule = assign_workloads_to_bubbles(
+            ngd_workloads, pipeline_workloads.copy())
+        schedule.append(
+            Workload(TURN_OFF_SAVE, schedule[-1].end, schedule[-1].end))
+
+        # assign all remaining workloads to the 1st and extra pipelines
+        while len(ngd_workloads) > 0:
+            remaining_workloads = copy.deepcopy(ngd_workloads)
+            # try to assign all the remaining workloads to the bubbles in the current schedule
+            new_schedule = assign_workloads_to_bubbles(remaining_workloads,
+                                                       schedule.copy(),
+                                                       fwd_count=num_micro_batches,
+                                                       bwd_count=num_micro_batches)
+            if len(remaining_workloads) == 0:
+                schedule = new_schedule
+                break
+
+            num_remaining_workloads_before = len(ngd_workloads)
+            # add one pipeline
+            additional_schedule = assign_workloads_to_bubbles(ngd_workloads,
+                                                              pipeline_workloads.copy(),
+                                                              fwd_count=num_micro_batches,
+                                                              bwd_count=num_micro_batches)
+            schedule += additional_schedule
+            if len(ngd_workloads) == num_remaining_workloads_before:
+                for _ in range(len(ngd_workloads)):
+                    schedule.append(ngd_workloads.pop(0))
+
+        schedule.append(
+            Workload(TURN_ON_SAVE, schedule[-1].end, schedule[-1].end))
+
+        total_time = 0
+        for workload in schedule:
+            total_time += workload.duration
+        num_pipeline_iterations = sum(
+            map(lambda x: x.label == PIPELINE_START, schedule))
+        usage = total_time / (pipeline_time * num_pipeline_iterations) * 100
+        print('*****************')
+        print(
+            f'node{node_id}:{num_pipeline_iterations} pipeline iterations (usage: {usage:.2f} %)')
+
+        if args.print_workloads:
+            last_workload = schedule[0]
+            schedule_with_bubbles = []
+            for i in range(1, len(schedule)):
+                schedule_with_bubbles.append(last_workload)
+                next_workload = schedule[i]
+                bubble_time = next_workload.start - last_workload.end
+                if bubble_time > 0:
+                    schedule_with_bubbles.append(
+                        Workload(BUBBLE, last_workload.end, next_workload.start))
+                last_workload = next_workload
+            schedule_with_bubbles.append(last_workload)
+            for workload in schedule_with_bubbles:
+                print(workload)
+
+        num_pipeline_iterations_list.append(num_pipeline_iterations)
+        schedules.append([workload.label for workload in schedule])
+
+    # split schedule of each pipeline
+    schedules_split = []
+    for schedule in schedules:
+        schedule_split = []
+        pipeline = [schedule.pop(0)]
+        for workload in schedule:
+            if workload == PIPELINE_START:
+                schedule_split.append(pipeline)
+                pipeline = [workload]
+            else:
+                pipeline.append(workload)
+        schedule_split.append(pipeline)
+        schedules_split.append(schedule_split)
+
+    if args.save_path is not None:
+        with open(args.save_path, 'wb') as f:
+            pickle.dump(schedules_split, f)
+
+
+def tryint(s):
+    """
+    Return an int if possible, or `s` unchanged.
+    """
+    try:
+        return int(s)
+    except ValueError:
+        return s
+
+
+def alphanum_key(s):
+    """
+    Turn a string into a list of string and number chunks.
+
+    >>> alphanum_key("z23a")
+    ["z", 23, "a"]
+
+    """
+    return [tryint(c) for c in re.split('([0-9]+)', s)]
+
+
+def human_sort(l):
+    """
+    Sort a list in the way that humans expect.
+    Sort according to the numbers in the parameters
+    """
+    l.sort(key=alphanum_key)
+
+
+def extract_last_iteration(timeline):
+    """
+        Split a pipeline into n_iterations of micro-batch
+    """
+    n_iterations = len(timeline['start_end'])
+    if n_iterations == 1:
+        return
+    for key in timeline:
+
+        n_items = len(timeline[key]) // n_iterations
+        timeline[key] = timeline[key][-n_items:]
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('pickle_paths', type=str)
+    parser.add_argument('--save_path', type=str, default=None)
+    parser.add_argument('--print_workloads', action='store_true')
+    args = parser.parse_args()
+
+    timelines = []
+    pickle_paths = args.pickle_paths.split(',')
+    human_sort(pickle_paths)
+
+    for pickle_path in pickle_paths:
+        if pickle_path == '':
+            continue
+        timeline = pickle.load(open(pickle_path, 'rb'))
+        extract_last_iteration(timeline)
+        timelines.append(timeline)
+    main()
+
+
+===== bert_optim.py =====
+
+# coding=utf-8
+# Copyright (c) 2019 NVIDIA CORPORATION. All rights reserved.
+# Copyright 2018 The Google AI Language Team Authors and The HugginFace Inc. team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""PyTorch optimization for BERT model."""
+
+import math
+import torch
+from torch.optim import Optimizer
+from torch.optim.optimizer import required
+from torch.nn.utils import clip_grad_norm_
+from torch.optim.lr_scheduler import _LRScheduler
+
+
+class LRScheduler(_LRScheduler):
+    def __init__(self, optimizer, last_epoch=-1):
+        # Check if using mixed precision training
+        self.mixed_training = False
+        base_optimizer = optimizer
+
+        # Check that optimizer param is valid
+        if not isinstance(optimizer, Optimizer):
+            raise TypeError('{} is not an Optimizer'.format(
+                type(optimizer).__name__))
+
+        super(LRScheduler, self).__init__(base_optimizer, last_epoch)
+
+    def step(self, epoch=None):
+        # Set the current training step
+        # ('epoch' is used to be consistent with _LRScheduler)
+        if self.mixed_training:
+            # The assumption is that the step will be constant
+            state_dict = self.optimizer.state[self.optimizer.param_groups[0]['params'][0]]
+            if 'step' in state_dict:
+                self.last_epoch = state_dict['step'] + 1
+            else:
+                self.last_epoch = 1
+        else:
+            self.last_epoch = epoch if epoch is not None else self.last_epoch + 1
+
+        for param_group, lr in zip(self.optimizer.param_groups, self.get_lr()):
+            param_group['lr'] = lr
+
+
+class PolyWarmUpScheduler(LRScheduler):
+    """
+    Applies a warm up period to the learning rate.
+    """
+
+    def __init__(self, optimizer, warmup, total_steps, degree=0.5, last_epoch=-1, base_lr=1., device='cpu'):
+        self.warmup = torch.tensor(warmup, device=device)
+        self.total_steps = torch.tensor(total_steps, device=device)
+        self.degree = torch.tensor(degree, device=device)
+        device_last_epoch = torch.tensor(last_epoch, device=device)
+        self.base_lr = torch.tensor(base_lr, device=device)
+        self.device = device
+        super(PolyWarmUpScheduler, self).__init__(optimizer, device_last_epoch)
+
+    def step(self, epoch=None):
+        param_group = self.optimizer.param_groups[0]
+        if 'step' in param_group:
+            self.last_epoch = param_group['step'] + 1
+        else:
+            self.last_epoch = torch.tensor(1., device=self.device)
+
+        for param_group, lr in zip(self.optimizer.param_groups, self.get_lr()):
+            param_group['lr'] = lr
+
+    def get_lr(self):
+        progress = self.last_epoch / self.total_steps
+        lr_tensor = torch.where(progress < self.warmup, self.base_lr * progress / self.warmup, self.base_lr * ((1.0 - progress) ** self.degree))
+        return [lr_tensor for _ in range(len(self.optimizer.param_groups))]
+
+
+def warmup_cosine(x, warmup=0.002):
+    if x < warmup:
+        return x/warmup
+    return 0.5 * (1.0 + torch.cos(math.pi * x))
+
+
+def warmup_constant(x, warmup=0.002):
+    if x < warmup:
+        return x/warmup
+    return 1.0
+
+
+def warmup_linear(x, warmup=0.002):
+    if x < warmup:
+        return x/warmup
+    return max((x - 1.)/(warmup - 1.), 0.)
+
+
+def warmup_poly(x, warmup=0.002, degree=0.5):
+    if x < warmup:
+        return x/warmup
+    return (1.0 - x)**degree
+
+
+SCHEDULES = {
+    'warmup_cosine': warmup_cosine,
+    'warmup_constant': warmup_constant,
+    'warmup_linear': warmup_linear,
+    'warmup_poly': warmup_poly,
+}
+
+
+class BertAdam(Optimizer):
+    """Implements BERT version of Adam algorithm with weight decay fix.
+    Params:
+        lr: learning rate
+        warmup: portion of t_total for the warmup, -1  means no warmup. Default: -1
+        t_total: total number of training steps for the learning
+            rate schedule, -1  means constant learning rate. Default: -1
+        schedule: schedule to use for the warmup (see above). Default: 'warmup_linear'
+        b1: Adams b1. Default: 0.9
+        b2: Adams b2. Default: 0.999
+        e: Adams epsilon. Default: 1e-6
+        weight_decay: Weight decay. Default: 0.01
+        max_grad_norm: Maximum norm for the gradients (-1 means no clipping). Default: 1.0
+    """
+    def __init__(self, params, lr=required, warmup=-1, t_total=-1, schedule='warmup_linear',
+                 b1=0.9, b2=0.999, e=1e-6, weight_decay=0.01, max_grad_norm=1.0, lars=False, weight_scaling=False):
+        if lr is not required and lr < 0.0:
+            raise ValueError("Invalid learning rate: {} - should be >= 0.0".format(lr))
+        if schedule not in SCHEDULES:
+            raise ValueError("Invalid schedule parameter: {}".format(schedule))
+        if not 0.0 <= warmup < 1.0 and not warmup == -1:
+            raise ValueError("Invalid warmup: {} - should be in [0.0, 1.0[ or -1".format(warmup))
+        if not 0.0 <= b1 < 1.0:
+            raise ValueError("Invalid b1 parameter: {} - should be in [0.0, 1.0[".format(b1))
+        if not 0.0 <= b2 < 1.0:
+            raise ValueError("Invalid b2 parameter: {} - should be in [0.0, 1.0[".format(b2))
+        if not e >= 0.0:
+            raise ValueError("Invalid epsilon value: {} - should be >= 0.0".format(e))
+        defaults = dict(lr=lr, schedule=schedule, warmup=warmup, t_total=t_total,
+                        b1=b1, b2=b2, e=e, weight_decay=weight_decay,
+                        max_grad_norm=max_grad_norm, lars=lars, weight_scaling=weight_scaling)
+
+        super(BertAdam, self).__init__(params, defaults)
+
+    def get_lr(self):
+        lr = []
+        for group in self.param_groups:
+            for p in group['params']:
+                state = self.state[p]
+                if len(state) == 0:
+                    return [0]
+                if group['t_total'] != -1:
+                    schedule_fct = SCHEDULES[group['schedule']]
+                    lr_scheduled = group['lr'] * schedule_fct(state['step']/group['t_total'], group['warmup'])
+                else:
+                    lr_scheduled = group['lr']
+                lr.append(lr_scheduled)
+        return lr
+
+    def step(self, closure=None):
+        """Performs a single optimization step.
+        Arguments:
+            closure (callable, optional): A closure that reevaluates the model
+                and returns the loss.
+        """
+        loss = None
+        if closure is not None:
+            loss = closure()
+
+        for group in self.param_groups:
+            if group['weight_scaling'] and 'p_norm' not in group:
+                group['p_norm'] = math.sqrt(sum(torch.square(p.data).sum() for p in group['params']))
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+
+                state = self.state[p]
+                # State initialization.
+                if len(state) == 0:
+                    state['step'] = 0
+                    if group['b1'] > 0:
+                        # Exponential moving average of gradient values.
+                        state['next_m'] = torch.zeros_like(p.data)
+                    if group['b2'] > 0:
+                        # Exponential moving average of squared gradient values.
+                        state['next_v'] = torch.zeros_like(p.data)
+
+                beta1, beta2 = group['b1'], group['b2']
+
+                # Add grad clipping.
+                if group['max_grad_norm'] > 0:
+                    clip_grad_norm_(p, group['max_grad_norm'])
+
+                # Decay the first and second moment running average coefficient.
+                # In-place operations to update the averages at the same time.
+                if beta1 > 0:
+                    next_m = state['next_m']
+                    next_m.mul_(beta1).add_(p.grad, alpha=1 - beta1)
+                else:
+                    next_m = p.grad
+                if beta2 == -1:
+                    update = next_m
+                else:
+                    if beta2 > 0:
+                        next_v = state['next_v']
+                        next_v.mul_(beta2).addcmul_(p.grad, p.grad, value=1 - beta2)
+                    else:
+                        next_v = torch.square(p.grad)
+                    update = next_m / (next_v.sqrt() + group['e'])
+
+                # Just adding the square of the weights to the loss function is *not*
+                # the correct way of using L2 regularization/weight decay with Adam,
+                # since that will interact with the m and v parameters in strange ways.
+                #
+                # Instead we want to decay the weights in a manner that doesn't interact
+                # with the m/v parameters. This is equivalent to adding the square
+                # of the weights to the loss with plain (non-momentum) SGD.
+                if group['weight_decay'] > 0.0:
+                    update += group['weight_decay'] * p.data
+
+                if group['lars']:
+                    weight_norm = torch.norm(p.data).clamp(0, 10)
+                    update_norm = torch.norm(update)
+                    if weight_norm == 0 or update_norm == 0:
+                        trust_ratio = 1
+                    else:
+                        trust_ratio = weight_norm / update_norm
+                else:
+                    trust_ratio = 1.
+                state['trust_ratio'] = trust_ratio
+
+                if group['t_total'] != -1:
+                    schedule_fct = SCHEDULES[group['schedule']]
+                    lr_scheduled = group['lr'] * schedule_fct(state['step']/group['t_total'], group['warmup'])
+                else:
+                    lr_scheduled = group['lr']
+
+                p.data.add_(update, alpha=-lr_scheduled * trust_ratio)
+
+                state['step'] += 1
+
+            if group['weight_scaling']:
+                p_norm = math.sqrt(sum(torch.square(p.data).sum() for p in group['params']))
+                if p_norm > 0:
+                    for p in group['params']:
+                        p.data.mul_(group['p_norm']/p_norm)
+
+        return loss
+
+
+===== bert_dataset.py =====
+
+import random
+from tqdm import tqdm
+import torch
+from torch.utils.data import Dataset
+
+
+class BERTDataset(Dataset):
+    def __init__(self, corpus_path, tokenizer, seq_len, encoding="utf-8", corpus_lines=None, on_memory=False):
+        self.vocab = tokenizer.vocab
+        self.tokenizer = tokenizer
+        self.seq_len = seq_len
+        self.on_memory = on_memory
+        self.corpus_lines = corpus_lines  # number of non-empty lines in input corpus
+        self.corpus_path = corpus_path
+        self.encoding = encoding
+        self.current_doc = 0  # to avoid random sentence from same doc
+
+        # for loading samples directly from file
+        self.sample_counter = 0  # used to keep track of full epochs on file
+        self.line_buffer = None  # keep second sentence of a pair in memory and use as first sentence in next pair
+
+        # for loading samples in memory
+        self.current_random_doc = 0
+        self.num_docs = 0
+        self.sample_to_doc = []  # map sample index to doc and line
+
+        # load samples into memory
+        if on_memory:
+            self.all_docs = []
+            doc = []
+            self.corpus_lines = 0
+            with open(corpus_path, "r", encoding=encoding) as f:
+                for line in tqdm(f, desc="Loading Dataset", total=corpus_lines):
+                    line = line.strip()
+                    if line == "":
+                        self.all_docs.append(doc)
+                        doc = []
+                        # remove last added sample because there won't be a subsequent line anymore in the doc
+                        self.sample_to_doc.pop()
+                    else:
+                        # store as one sample
+                        sample = {"doc_id": len(self.all_docs),
+                                  "line": len(doc)}
+                        self.sample_to_doc.append(sample)
+                        doc.append(line)
+                        self.corpus_lines = self.corpus_lines + 1
+
+            # if last row in file is not empty
+            if self.all_docs[-1] != doc:
+                self.all_docs.append(doc)
+                self.sample_to_doc.pop()
+
+            self.num_docs = len(self.all_docs)
+
+        # load samples later lazily from disk
+        else:
+            if self.corpus_lines is None:
+                with open(corpus_path, "r", encoding=encoding) as f:
+                    self.corpus_lines = 0
+                    for line in tqdm(f, desc="Loading Dataset", total=corpus_lines):
+                        if line.strip() == "":
+                            self.num_docs += 1
+                        else:
+                            self.corpus_lines += 1
+
+                    # if doc does not end with empty line
+                    if line.strip() != "":
+                        self.num_docs += 1
+
+            self.file = open(corpus_path, "r", encoding=encoding)
+            self.random_file = open(corpus_path, "r", encoding=encoding)
+
+    def __len__(self):
+        # last line of doc won't be used, because there's no "nextSentence". Additionally, we start counting at 0.
+        return self.corpus_lines - self.num_docs - 1
+
+    def __getitem__(self, item):
+        cur_id = self.sample_counter
+        self.sample_counter += 1
+        if not self.on_memory:
+            # after one epoch we start again from beginning of file
+            if cur_id != 0 and (cur_id % len(self) == 0):
+                self.file.close()
+                self.file = open(self.corpus_path, "r", encoding=self.encoding)
+
+        t1, t2, is_next_label = self.random_sent(item)
+
+        # tokenize
+        tokens_a = self.tokenizer.tokenize(t1)
+        tokens_b = self.tokenizer.tokenize(t2)
+
+        # combine to one sample
+        cur_example = InputExample(guid=cur_id, tokens_a=tokens_a, tokens_b=tokens_b, is_next=is_next_label)
+
+        # transform sample to features
+        cur_features = convert_example_to_features(cur_example, self.seq_len, self.tokenizer)
+
+        cur_tensors = dict(
+            input_ids=torch.tensor(cur_features.input_ids),
+            attention_mask=torch.tensor(cur_features.input_mask),
+            token_type_ids=torch.tensor(cur_features.segment_ids),
+            labels=torch.tensor(cur_features.lm_label_ids),
+            next_sentence_label=torch.tensor(cur_features.is_next))
+
+        return cur_tensors
+
+    def random_sent(self, index):
+        """
+        Get one sample from corpus consisting of two sentences. With prob. 50% these are two subsequent sentences
+        from one doc. With 50% the second sentence will be a random one from another doc.
+        :param index: int, index of sample.
+        :return: (str, str, int), sentence 1, sentence 2, isNextSentence Label
+        """
+        t1, t2 = self.get_corpus_line(index)
+        if random.random() > 0.5:
+            label = 0
+        else:
+            while True:
+                t2 = self.get_random_line()
+                if len(t2) > 0:
+                    break
+            label = 1
+
+        assert len(t1) > 0, "empty t1 in random_send"
+        assert len(t2) > 0, "empty t2 in random_send"
+        return t1, t2, label
+
+    def get_corpus_line(self, item):
+        """
+        Get one sample from corpus consisting of a pair of two subsequent lines from the same doc.
+        :param item: int, index of sample.
+        :return: (str, str), two subsequent sentences from corpus
+        """
+        t1 = ""
+        t2 = ""
+        assert item < self.corpus_lines, "out of dataset bound"
+        if self.on_memory:
+            sample = self.sample_to_doc[item]
+            t1 = self.all_docs[sample["doc_id"]][sample["line"]]
+            t2 = self.all_docs[sample["doc_id"]][sample["line"]+1]
+            # used later to avoid random nextSentence from same doc
+            self.current_doc = sample["doc_id"]
+            return t1, t2
+        else:
+            if self.line_buffer is None:
+                # read first non-empty line of file
+                while t1 == "" or t2 == "":
+                    t1 = next(self.file).strip()
+                    t2 = next(self.file).strip()
+            else:
+                # use t2 from previous iteration as new t1
+                t1 = self.line_buffer
+                t2 = next(self.file).strip()
+                # skip empty rows that are used for separating documents and keep track of current doc id
+                while t2 == "" or t1 == "":
+                    t1 = next(self.file).strip()
+                    t2 = next(self.file).strip()
+                    self.current_doc = self.current_doc+1
+            self.line_buffer = t2
+
+        assert t1 != "", "t1 empty"
+        assert t2 != "", "t2 empty"
+        return t1, t2
+
+    def get_random_line(self):
+        """
+        Get random line from another document for nextSentence task.
+        :return: str, content of one line
+        """
+        # Similar to original tf repo: This outer loop should rarely go for more than one iteration for large
+        # corpora. However, just to be careful, we try to make sure that
+        # the random document is not the same as the document we're processing.
+        for _ in range(10):
+            if self.on_memory:
+                rand_doc_idx = random.randint(0, len(self.all_docs)-1)
+                rand_doc = self.all_docs[rand_doc_idx]
+                line = rand_doc[random.randrange(len(rand_doc))]
+            else:
+                rand_index = random.randint(1, self.corpus_lines if self.corpus_lines < 1000 else 1000)
+                # pick random line
+                for _ in range(rand_index):
+                    line = self.get_next_line()
+            # check if our picked random line is really from another doc like we want it to be
+            if self.current_random_doc != self.current_doc:
+                break
+        return line
+
+    def get_next_line(self):
+        """ Gets next line of random_file and starts over when reaching end of file"""
+        try:
+            line = next(self.random_file).strip()
+            # keep track of which document we are currently looking at to later avoid having the same doc as t1
+            if line == "":
+                self.current_random_doc = self.current_random_doc + 1
+                line = next(self.random_file).strip()
+        except StopIteration:
+            self.random_file.close()
+            self.random_file = open(self.corpus_path, "r", encoding=self.encoding)
+            line = next(self.random_file).strip()
+        return line
+
+
+class InputExample(object):
+    """A single training/test example for the language model."""
+
+    def __init__(self, guid, tokens_a, tokens_b=None, is_next=None, lm_labels=None):
+        """Constructs a InputExample.
+
+        Args:
+            guid: Unique id for the example.
+            tokens_a: string. The untokenized text of the first sequence. For single
+            sequence tasks, only this sequence must be specified.
+            tokens_b: (Optional) string. The untokenized text of the second sequence.
+            Only must be specified for sequence pair tasks.
+        """
+        self.guid = guid
+        self.tokens_a = tokens_a
+        self.tokens_b = tokens_b
+        self.is_next = is_next  # nextSentence
+        self.lm_labels = lm_labels  # masked words for language model
+
+
+class InputFeatures(object):
+    """A single set of features of data."""
+
+    def __init__(self, input_ids, input_mask, segment_ids, is_next, lm_label_ids):
+        self.input_ids = input_ids
+        self.input_mask = input_mask
+        self.segment_ids = segment_ids
+        self.is_next = is_next
+        self.lm_label_ids = lm_label_ids
+
+
+def random_word(tokens, tokenizer):
+    """
+    Masking some random tokens for Language Model task with probabilities as in the original BERT paper.
+    :param tokens: list of str, tokenized sentence.
+    :param tokenizer: Tokenizer, object used for tokenization (we need it's vocab here)
+    :return: (list of str, list of int), masked tokens and related labels for LM prediction
+    """
+    output_label = []
+
+    for i, token in enumerate(tokens):
+        prob = random.random()
+        # mask token with 15% probability
+        if prob < 0.15:
+            prob /= 0.15
+
+            # 80% randomly change token to mask token
+            if prob < 0.8:
+                tokens[i] = "[MASK]"
+
+            # 10% randomly change token to random token
+            elif prob < 0.9:
+                tokens[i] = random.choice(list(tokenizer.vocab.items()))[0]
+
+            # -> rest 10% randomly keep current token
+
+            # append current token to output (we will predict these later)
+            try:
+                output_label.append(tokenizer.vocab[token])
+            except KeyError:
+                # For unknown words (should not occur with BPE vocab)
+                output_label.append(tokenizer.vocab["[UNK]"])
+        else:
+            # no masking token (will be ignored by loss function later)
+            output_label.append(-100)
+
+    return tokens, output_label
+
+
+def convert_example_to_features(example, max_seq_length, tokenizer):
+    """
+    Convert a raw sample (pair of sentences as tokenized strings) into a proper training sample with
+    IDs, LM labels, input_mask, CLS and SEP tokens etc.
+    :param example: InputExample, containing sentence input as strings and is_next label
+    :param max_seq_length: int, maximum length of sequence.
+    :param tokenizer: Tokenizer
+    :return: InputFeatures, containing all inputs and labels of one sample as IDs (as used for model training)
+    """
+    tokens_a = example.tokens_a
+    tokens_b = example.tokens_b
+    # Modifies `tokens_a` and `tokens_b` in place so that the total
+    # length is less than the specified length.
+    # Account for [CLS], [SEP], [SEP] with "- 3"
+    _truncate_seq_pair(tokens_a, tokens_b, max_seq_length - 3)
+
+    tokens_a, t1_label = random_word(tokens_a, tokenizer)
+    tokens_b, t2_label = random_word(tokens_b, tokenizer)
+    # concatenate lm labels and account for CLS, SEP, SEP
+    lm_label_ids = ([-100] + t1_label + [-100] + t2_label + [-100])
+
+    # The convention in BERT is:
+    # (a) For sequence pairs:
+    #  tokens:   [CLS] is this jack ##son ##ville ? [SEP] no it is not . [SEP]
+    #  type_ids: 0   0  0    0    0     0       0 0    1  1  1  1   1 1
+    # (b) For single sequences:
+    #  tokens:   [CLS] the dog is hairy . [SEP]
+    #  type_ids: 0   0   0   0  0     0 0
+    #
+    # Where "type_ids" are used to indicate whether this is the first
+    # sequence or the second sequence. The embedding vectors for `type=0` and
+    # `type=1` were learned during pre-training and are added to the wordpiece
+    # embedding vector (and position vector). This is not *strictly* necessary
+    # since the [SEP] token unambigiously separates the sequences, but it makes
+    # it easier for the model to learn the concept of sequences.
+    #
+    # For classification tasks, the first vector (corresponding to [CLS]) is
+    # used as as the "sentence vector". Note that this only makes sense because
+    # the entire model is fine-tuned.
+    tokens = []
+    segment_ids = []
+    tokens.append("[CLS]")
+    segment_ids.append(0)
+    for token in tokens_a:
+        tokens.append(token)
+        segment_ids.append(0)
+    tokens.append("[SEP]")
+    segment_ids.append(0)
+
+    assert len(tokens_b) > 0, "empty tokens_b"
+    for token in tokens_b:
+        tokens.append(token)
+        segment_ids.append(1)
+    tokens.append("[SEP]")
+    segment_ids.append(1)
+
+    input_ids = tokenizer.convert_tokens_to_ids(tokens)
+
+    # The mask has 1 for real tokens and 0 for padding tokens. Only real
+    # tokens are attended to.
+    input_mask = [1] * len(input_ids)
+
+    # Zero-pad up to the sequence length.
+    while len(input_ids) < max_seq_length:
+        input_ids.append(0)
+        input_mask.append(0)
+        segment_ids.append(0)
+        lm_label_ids.append(-100)
+
+    assert len(input_ids) == max_seq_length, "input_ids not equal to max len"
+    assert len(input_mask) == max_seq_length, "input_mask not equal to max len"
+    assert len(segment_ids) == max_seq_length, "segment_ids not equal to max len"
+    assert len(lm_label_ids) == max_seq_length, "lm_label_ids not equal to max len"
+
+    features = InputFeatures(input_ids=input_ids,
+                             input_mask=input_mask,
+                             segment_ids=segment_ids,
+                             lm_label_ids=lm_label_ids,
+                             is_next=example.is_next)
+    return features
+
+
+def _truncate_seq_pair(tokens_a, tokens_b, max_length):
+    """Truncates a sequence pair in place to the maximum length."""
+
+    # This is a simple heuristic which will always truncate the longer sequence
+    # one token at a time. This makes more sense than truncating an equal percent
+    # of tokens from each, since if one sequence is very short then each token
+    # that's truncated likely contains more information than a longer sequence.
+    while True:
+        total_length = len(tokens_a) + len(tokens_b)
+        if total_length <= max_length:
+            break
+        if len(tokens_a) > len(tokens_b):
+            tokens_a.pop()
+        else:
+            tokens_b.pop()
+
+
+
+
+===== threadsafe_queue.py =====
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
+import threading
+
+"""
+Implementation of a thread-safe queue with one producer and one consumer.
+"""
+class Queue:
+    def __init__(self):
+        self.queue = []
+        self.cv = threading.Condition()
+
+    def __len__(self):
+        return len(self.queue)
+
+    def add(self, tensor):
+        self.cv.acquire()
+        self.queue.append(tensor)
+        self.cv.notify()
+        self.cv.release()
+
+    def remove(self):
+        self.cv.acquire()
+        while len(self.queue) == 0:
+            self.cv.wait()
+        tensor = self.queue.pop(0)
+        self.cv.release()
+        return tensor
+
+
+===== pipeline.py =====
+
+import time
+import collections
+from collections import deque
+from typing import List, Tuple, Deque, OrderedDict, Iterator, Union, Dict
+from contextlib import nullcontext
+
+import torch
+from torch import Tensor
+from torch import nn
+from torch.nn.parallel import DistributedDataParallel
+from torch.nn.utils import parameters_to_vector, vector_to_parameters
+import torch.distributed as dist
+from torch.cuda import nvtx
+
+
+import threading
+import threadsafe_queue
+from auto_schedule import PIPELINE_END, FORWARD, BACKWARD, \
+    COV_KRON_A, COV_KRON_B, INV_KRON_A, INV_KRON_B, SYNC_KRON_A, SYNC_KRON_B, \
+    TURN_OFF_SAVE, TURN_ON_SAVE, TAG_UP_PIPE
+from chimera_pipeline_rank import AutoGeneratePipelineRank, MyPipeLine
+
+PIPELINE_1F1B = '1f1b'
+PIPELINE_GPIPE = 'gpipe'
+PIPELINE_CHIMERA = 'chimera'
+PIPELINE_INTER = 'interleave'
+
+
+class StageModule(nn.Module):
+    @property
+    def keys_from_source(self) -> List[str]:
+        raise NotImplementedError
+
+    @property
+    def sizes_from_prev_stage(self) -> Dict[str, Tuple]:
+        raise NotImplementedError
+
+    @property
+    def sizes_for_next_stage(self) -> Dict[str, Tuple]:
+        raise NotImplementedError
+
+
+def start_comm_thread(func, kwargs):
+    comm_thread = threading.Thread(target=func, kwargs=kwargs)
+    comm_thread.daemon = True
+    comm_thread.start()
+
+
+class PipelineStage:
+    def __init__(self,
+                 stage_id: int,
+                 num_stages: int,
+                 stage_module: Union[StageModule, DistributedDataParallel],
+                 batch_sizes: Tuple[int, ...],
+                 prev_rank: int = None,
+                 next_rank: int = None,
+                 rank: int = None,
+                 grad_sync_group: dist.ProcessGroup = None,
+                 pipeline_method: str = None,
+                 recompute: bool = False,
+                 is_up_pipe: bool = False,
+                 chunks: int = None,
+                 pipe_stage=None,
+                 interleaved_stages: List = [],
+                 nvtx_tag=''):
+        assert dist.is_initialized(), 'torch.distributed needs to be initialized.'
+        assert num_stages > 1, 'num_stages has to be > 1.'
+        assert stage_id in range(
+            num_stages), 'stage_id has be in range(num_stage).'
+        self.stage_id = stage_id
+        self.num_stages = num_stages
+        self.stage_module = stage_module
+        self.batch_sizes = batch_sizes
+        self.input_output_queue: Deque[Tuple[OrderedDict[str,
+                                                         Tensor], OrderedDict[str, Tensor]]] = deque()
+        self.prev_rank = prev_rank
+        self.next_rank = next_rank
+        self.rank = rank
+        self.grad_sync_group = grad_sync_group
+        self.device = next(stage_module.parameters()).device
+        self.total_loss = 0.
+        self.pipeline_method = pipeline_method
+        self.recompute = recompute
+        self.is_up_pipe = is_up_pipe
+        if not self.is_up_pipe and self.pipeline_method == PIPELINE_CHIMERA:
+            assert pipe_stage is not None, 'Up pipeline should be created.'
+        self.pipe_stage = pipe_stage
+        self.interleaved_stages = interleaved_stages
+        self.chunks = chunks
+        self.tag = 2 if is_up_pipe else 1
+        self.nvtx_tag = nvtx_tag
+
+        self.forward_recv_queues = {}
+        self.backward_recv_queues = {}
+        self.forward_send_queues = {}
+        self.backward_send_queues = {}
+
+        self.handles = []
+        self.grads = []
+        self.packed_grads = []
+
+        self.init_comm_queues()
+
+    @property
+    def is_first_stage(self):
+        return self.stage_id == 0
+
+    @property
+    def is_last_stage(self):
+        return self.stage_id == self.num_stages - 1
+
+    @property
+    def keys_from_source(self):
+        if isinstance(self.stage_module, DistributedDataParallel):
+            return self.stage_module.module.keys_from_source
+        return self.stage_module.keys_from_source
+
+    @property
+    def sizes_from_prev_stage(self) -> Dict[str, Tuple]:
+        stage_module = self.stage_module
+        if isinstance(stage_module, DistributedDataParallel):
+            stage_module = stage_module.module
+        return stage_module.sizes_from_prev_stage
+
+    @property
+    def keys_from_prev_stage(self) -> List[str]:
+        return list(self.sizes_from_prev_stage.keys())
+
+    @property
+    def sizes_for_next_stage(self) -> Dict[str, Tuple]:
+        stage_module = self.stage_module
+        if isinstance(stage_module, DistributedDataParallel):
+            stage_module = stage_module.module
+        return stage_module.sizes_for_next_stage
+
+    @property
+    def keys_for_next_stage(self):
+        return list(self.sizes_for_next_stage.keys())
+
+    @property
+    def is_distributed(self):
+        return self.grad_sync_group is not None and self.grad_sync_group.size() > 1
+
+    def init_comm_queues(self):
+        if not self.is_last_stage:
+            for key in self.keys_for_next_stage:
+                self.backward_recv_queues[key] = threadsafe_queue.Queue()
+                self.forward_send_queues[key] = threadsafe_queue.Queue()
+        if not self.is_first_stage:
+            for key in self.keys_from_prev_stage:
+                self.forward_recv_queues[key] = threadsafe_queue.Queue()
+                self.backward_send_queues[key] = threadsafe_queue.Queue()
+
+    @staticmethod
+    def recv_comm_thread(num_iterations, queue, src_rank, tag, tensor_shape, device):
+        for _ in range(num_iterations):
+            recv_tensor = torch.zeros(tensor_shape, requires_grad=True)
+            if dist.get_backend() == dist.Backend.NCCL:
+                recv_tensor = recv_tensor.to(device)
+            dist.recv(tensor=recv_tensor, src=src_rank, tag=tag)
+            queue.add(recv_tensor.to(device))
+
+    @staticmethod
+    def send_comm_thread(num_iterations, queue, dst_rank, tag):
+        for _ in range(num_iterations):
+            send_tensor = queue.remove()
+            if dist.get_backend() != dist.Backend.NCCL:
+                send_tensor = send_tensor.cpu()
+            
+            dist.send(tensor=send_tensor, dst=dst_rank, tag=tag)
+
+    def start_comm_threads(self, num_iterations):
+        def start_recv_threads(recv_queues, src_rank, tensor_shapes):
+            for key, queue in recv_queues.items():
+                start_comm_thread(self.recv_comm_thread,
+                                  dict(num_iterations=num_iterations,
+                                       queue=queue,
+                                       src_rank=src_rank,
+                                       tag=self.tag,
+                                       tensor_shape=self.batch_sizes +
+                                       tensor_shapes[key],
+                                       device=self.device))
+
+        def start_send_threads(queues, dst_rank):
+            for key, queue in queues.items():
+                start_comm_thread(self.send_comm_thread,
+                                  dict(num_iterations=num_iterations,
+                                       queue=queue,
+                                       dst_rank=dst_rank,
+                                       tag=self.tag))
+
+        start_recv_threads(self.forward_recv_queues,
+                           self.prev_rank, self.sizes_from_prev_stage)
+        start_send_threads(self.forward_send_queues, self.next_rank)
+        start_recv_threads(self.backward_recv_queues,
+                           self.next_rank, self.sizes_for_next_stage)
+        start_send_threads(self.backward_send_queues, self.prev_rank)
+
+    def start_interleaved_pipeline_comm_threads(self, num_iterations):
+        def start_recv_threads(recv_queues, src_rank, tensor_shapes, tag):
+            for key, queue in recv_queues.items():
+                start_comm_thread(self.recv_comm_thread,
+                                  dict(num_iterations=num_iterations,
+                                       queue=queue,
+                                       src_rank=src_rank,
+                                       tag=tag,
+                                       tensor_shape=self.batch_sizes +
+                                       tensor_shapes[key],
+                                       device=self.device))
+
+        def start_send_threads(queues, dst_rank, tag):
+            for queue in queues.values():
+                start_comm_thread(self.send_comm_thread,
+                                  dict(num_iterations=num_iterations,
+                                       queue=queue,
+                                       dst_rank=dst_rank,
+                                       tag=tag))
+
+        start_recv_threads(self.forward_recv_queues, self.prev_rank,
+                           self.sizes_from_prev_stage, self.stage_id)
+        start_send_threads(self.forward_send_queues,
+                           self.next_rank, self.stage_id+1)
+        start_recv_threads(self.backward_recv_queues, self.next_rank,
+                           self.sizes_for_next_stage, self.stage_id+1)
+        start_send_threads(self.backward_send_queues,
+                           self.prev_rank, self.stage_id)
+        #start_recv_threads(self.forward_recv_queues, self.prev_rank, self.sizes_from_prev_stage, 1)
+        #start_send_threads(self.forward_send_queues, self.next_rank, 1)
+        #start_recv_threads(self.backward_recv_queues, self.next_rank, self.sizes_for_next_stage, 1)
+        #start_send_threads(self.backward_send_queues, self.prev_rank, 1)
+
+    def send_outputs_to_queue(self, key, tensor):
+        self.forward_send_queues[key].add(tensor)
+
+    def send_input_grads_to_queue(self, key, tensor):
+        self.backward_send_queues[key].add(tensor)
+
+    def recv_inputs_from_queue(self, key):
+        return self.forward_recv_queues[key].remove()
+
+    def recv_output_grads_from_queue(self, key):
+        return self.backward_recv_queues[key].remove()
+
+    def call_forward(self, input_source: OrderedDict[str, Tensor]):
+        nvtx.range_push('call_forward' + self.nvtx_tag)
+
+        inputs = collections.OrderedDict()
+        if not self.is_first_stage:
+            for key in self.keys_from_prev_stage:
+                inputs[key] = self.recv_inputs_from_queue(key)
+        for key in self.keys_from_source:
+            inputs[key] = input_source[key].to(self.device)
+        assert len(inputs) > 0, 'No input is set.'
+
+        no_grad_if_recompute = torch.no_grad if self.recompute else nullcontext
+        with no_grad_if_recompute():
+            outputs = self.stage_module(**inputs)
+
+        if not self.is_last_stage:
+            for key in outputs:
+                self.send_outputs_to_queue(key, outputs[key])
+        else:
+            self.total_loss += float(outputs['loss'])
+
+        # push inputs/outputs to the queue
+        self.input_output_queue.append((inputs, outputs))
+
+        nvtx.range_pop()
+
+    def call_backward(self, no_sync=True):
+        nvtx.range_push('call_backward' + self.nvtx_tag)
+        assert len(self.input_output_queue) > 0, 'No input/output is set.'
+        # pop inputs/outputs from the queue
+        inputs, outputs = self.input_output_queue.popleft()
+        if self.recompute:
+            with nvtx.range('recompute'):
+                outputs = self.stage_module(**inputs)
+
+        out_tensors = tuple(outputs.values())
+        grad_tensors = None
+        if not self.is_last_stage:
+            grad_tensors = tuple(
+                self.recv_output_grads_from_queue(key) for key in outputs)
+
+        input_grads = collections.OrderedDict()
+
+        def get_hook(key):
+            def hook(grad):
+                input_grads[key] = grad
+            return hook
+
+        if not self.is_first_stage:
+            for key in self.keys_from_prev_stage:
+                inputs[key].register_hook(get_hook(key))
+
+        with self.no_sync_if_need(no_sync):
+            torch.autograd.backward(out_tensors, grad_tensors=grad_tensors)
+        if not self.is_first_stage:
+            for key in self.keys_from_prev_stage:
+                self.send_input_grads_to_queue(key, input_grads[key])
+
+        del inputs, outputs
+
+        nvtx.range_pop()
+
+    def no_sync_if_need(self, no_sync: bool):
+        if isinstance(self.stage_module, DistributedDataParallel) and no_sync:
+            return self.stage_module.no_sync()
+        return nullcontext()
+
+    @nvtx.range('sync_grad')
+    def sync_grad(self):
+        nvtx.range_push('sync_grad' + self.nvtx_tag)
+
+        assert self.grad_sync_group is not None, 'grad_sync_group is not specified.'
+        dist.barrier(group=self.grad_sync_group)
+        grads = [p.grad for p in self.stage_module.parameters()
+                 if p.grad is not None]
+        packed_tensor = parameters_to_vector(grads)
+        dist.all_reduce(packed_tensor, group=self.grad_sync_group)
+        packed_tensor /= self.grad_sync_group.size()
+        vector_to_parameters(packed_tensor, grads)
+
+        nvtx.range_pop()
+
+    def nb_sync_grad(self):
+        nvtx.range_push('nb_sync_grad' + self.nvtx_tag)
+
+        assert self.grad_sync_group is not None, 'grad_sync_group is not specified.'
+        dist.barrier(group=self.grad_sync_group)
+        grads = [p.grad for p in self.stage_module.parameters()
+                 if p.grad is not None]
+        self.grads.append(grads)
+        packed_tensor = parameters_to_vector(self.grads[-1])
+        self.packed_grads.append(packed_tensor)
+        self.handles.append(dist.all_reduce(
+            self.packed_grads[-1], group=self.grad_sync_group, async_op=True))
+
+        nvtx.range_pop()
+
+    def wait_all(self):
+        nvtx.range_push('wait_all' + self.nvtx_tag)
+
+        for _ in range(len(self.handles)):
+            self.handles.pop(0).wait()
+            packed_tensor = self.packed_grads.pop(
+                0) / self.grad_sync_group.size()
+            vector_to_parameters(packed_tensor, self.grads.pop(0))
+
+        nvtx.range_pop()
+
+    def assert_intermediate_queues_are_empty(self):
+        assert len(
+            self.input_output_queue) == 0, f'input_output_queue of stage{self.stage_id} is not empty.'
+        for name, queues in [('forward_send', self.forward_send_queues),
+                             ('backward_recv', self.backward_recv_queues)]:
+            for key, queue in queues.items():
+                assert len(
+                    queue) == 0, f'{name}_queue for {key} of stage{self.stage_id} is not empty.'
+
+    @nvtx.range('call_pipeline')
+    def call_pipeline(self,
+                      data_iterator: Iterator,
+                      num_micro_batches,
+                      pipeline_method=None,
+                      data_iterator_for_up_pipe: Iterator = None,
+                      iteration: int = None,
+                      no_sync_grad=False):
+        if pipeline_method is None:
+            pipeline_method = self.pipeline_method
+
+        kwargs = dict(data_iterator=data_iterator,
+                      num_micro_batches=num_micro_batches, no_sync_grad=no_sync_grad)
+        if pipeline_method == PIPELINE_1F1B:
+            _call_pipeline = self._call_1f1b_pipeline
+        elif pipeline_method == PIPELINE_INTER:
+            _call_pipeline = self._call_interleaved_1f1b_pipeline
+        elif pipeline_method == PIPELINE_GPIPE:
+            _call_pipeline = self._call_gpipe_pipeline
+        elif pipeline_method == PIPELINE_CHIMERA:
+            _call_pipeline = self._call_chimera_pipeline
+            kwargs['data_iterator_for_up_pipe'] = data_iterator_for_up_pipe
+        else:
+            raise ValueError(f'Invalid pipeline_method: {pipeline_method}')
+
+        self.total_loss = 0.
+        self.assert_intermediate_queues_are_empty()
+        _call_pipeline(**kwargs)
+        self.assert_intermediate_queues_are_empty()
+        return self.total_loss
+
+    def _call_1f1b_pipeline(self, data_iterator: Iterator, num_micro_batches, no_sync_grad=False):
+        """
+        1F1B
+        """
+        num_warmup_steps = self.num_stages - self.stage_id - 1
+
+        for _ in range(num_warmup_steps):
+            self.call_forward(next(data_iterator))
+        for _ in range(num_micro_batches - num_warmup_steps - 1):
+            self.call_forward(next(data_iterator))
+            self.call_backward()
+        self.call_forward(next(data_iterator))
+        for _ in range(num_warmup_steps):
+            self.call_backward()
+        self.call_backward()
+
+        if self.is_distributed and not no_sync_grad:
+            self.sync_grad()
+
+    def _call_interleaved_1f1b_pipeline(self, data_iterator: Iterator, num_micro_batches, no_sync_grad=False):
+        """
+        Interleaved 1F1B
+        """
+        num_micro_batches = num_micro_batches*self.chunks
+        pipeline_parallel_size = self.num_stages // self.chunks
+        pipeline_parallel_rank = self.stage_id % pipeline_parallel_size
+
+        num_warmup_steps = (pipeline_parallel_size -
+                            pipeline_parallel_rank - 1) * 2
+        num_warmup_steps += (self.chunks - 1) * pipeline_parallel_size
+
+        forward_counter = 0
+        backward_counter = 0
+
+        for _ in range(num_warmup_steps):
+            forward_chunk_id = (forward_counter //
+                                pipeline_parallel_size) % self.chunks
+            if forward_chunk_id == 0:
+                self.call_forward(next(data_iterator))
+            else:
+                self.interleaved_stages[forward_chunk_id -
+                                        1].call_forward(next(data_iterator))
+            forward_counter += 1
+        for _ in range(num_micro_batches - num_warmup_steps):
+            forward_chunk_id = (forward_counter //
+                                pipeline_parallel_size) % self.chunks
+            if forward_chunk_id == 0:
+                self.call_forward(next(data_iterator))
+            else:
+                self.interleaved_stages[forward_chunk_id -
+                                        1].call_forward(next(data_iterator))
+            forward_counter += 1
+
+            backward_chunk_id = self.chunks - \
+                (backward_counter // pipeline_parallel_size) % self.chunks - 1
+            if backward_chunk_id == 0:
+                self.call_backward()
+            else:
+                self.interleaved_stages[backward_chunk_id-1].call_backward()
+            backward_counter += 1
+
+        for _ in range(num_warmup_steps):
+            backward_chunk_id = self.chunks - \
+                (backward_counter // pipeline_parallel_size) % self.chunks - 1
+            if backward_chunk_id == 0:
+                self.call_backward()
+            else:
+                self.interleaved_stages[backward_chunk_id-1].call_backward()
+            backward_counter += 1
+
+        if self.is_distributed and not no_sync_grad:
+            self.sync_grad()
+            for stage in self.interleaved_stages:
+                stage.sync_grad()
+
+    def _call_gpipe_pipeline(self, data_iterator: Iterator, num_micro_batches, no_sync_grad=False):
+        """
+        GPipe
+        """
+        for _ in range(num_micro_batches):
+            self.call_forward(next(data_iterator))
+
+        for _ in range(num_micro_batches):
+            self.call_backward()
+
+        if self.is_distributed and not no_sync_grad:
+            self.sync_grad()
+
+    def _call_chimera_pipeline(self,
+                               data_iterator: Iterator,
+                               data_iterator_for_up_pipe: Iterator,
+                               num_micro_batches,
+                               no_sync_grad=False):
+        """
+        Chimera with dual pipelines
+        """
+        assert self.num_stages % 2 == 0, 'The number of stages should be an even value.'
+        assert num_micro_batches * \
+            2 % self.num_stages == 0, 'num_micro_batches*2 should be a multiple of num_stages.'
+        acc_steps = num_micro_batches * 2 // self.num_stages
+        half_stages = self.num_stages // 2
+        first_half = self.stage_id // half_stages == 0
+
+        schedule_number_a = half_stages - self.stage_id
+        if schedule_number_a <= 0:
+            schedule_number_a = -schedule_number_a + 1
+        schedule_number_b = half_stages - schedule_number_a
+
+        def call(func_name, index, down_or_up, up_side_down=False, with_data=False):
+            args = []
+            if with_data:
+                data = next(data_iterator) if down_or_up == 'down' else next(
+                    data_iterator_for_up_pipe)
+                args.append(data)
+            # if down_or_up == 'down':
+            #     getattr(self, func_name)(*args)
+            # else:
+            #     getattr(self.pipe_stage, func_name)(*args)
+            getattr(self.pipe_stage[index], func_name)(*args)
+
+        def forward(index, down_or_up):
+            call('call_forward', index, down_or_up,
+                 up_side_down=not first_half, with_data=True)
+
+        def backward(index, down_or_up):
+            call('call_backward', index, down_or_up,
+                 up_side_down=not first_half)
+        def wait_all():
+            if not no_sync_grad:
+                 
+                for s in self.pipe_stage:
+                    s.wait_all()
+
+        def sync_grad(index, down_or_up):
+            if not no_sync_grad:
+                call('nb_sync_grad', index, down_or_up)
+        pipeline = AutoGeneratePipelineRank(
+            self.num_stages, 2, num_micro_batches*2)
+        pipeline.generate_pipeline()
+        schedule_pipeline = pipeline.get_schedule(True)
+        pipeline_schedule = []
+        for sub_schedule in schedule_pipeline:
+            pipeline_schedule.append(sub_schedule)
+        for sub_schedule in pipeline_schedule:
+            if sub_schedule[self.stage_id] != '':
+                index, up_down, forward_backward = sub_schedule[self.stage_id].split(
+                    "@")
+                index = int(index)  
+                if forward_backward == 'f':
+                    forward(index, up_down)
+                elif forward_backward == 'b':
+                    backward(index, up_down)
+                elif forward_backward == 's':
+                    sync_grad(index, up_down)
+        wait_all()
+
+
+===== threadsafe_counter.py =====
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
+import threading
+
+"""
+Implementation of a thread-safe counter with many producers and many consumers.
+"""
+class Counter:
+    def __init__(self, initial_count):
+        self.count = initial_count
+        self.cv = threading.Condition()
+
+    def decrement(self):
+        self.cv.acquire()
+        self.count -= 1
+        self.cv.notify_all()
+        self.cv.release()
+
+    def wait(self):
+        self.cv.acquire()
+        while self.count > 0:
+            self.cv.wait()
+        self.cv.release()
+
+
+===== concatenate.py =====
+
+import os
+
+# Define the output file name
+output_file_name = 'concatenated_code_files.txt'
+
+# Define the types of files to include, e.g., Python files only
+included_extensions = ['.py', '.sh']
+
+# Open the output file in write mode
+with open(output_file_name, 'w') as output_file:
+    # Iterate over each item in the current directory
+    for item in os.listdir('.'):
+        # Check if the item is a file and has an included extension
+        if os.path.isfile(item) and any(item.endswith(ext) for ext in included_extensions):
+            # Write a header for the file
+            output_file.write(f'===== {item} =====\n\n')
+            # Open and read the current file
+            with open(item, 'r') as input_file:
+                # Write the content of the file to the output file
+                output_file.write(input_file.read())
+                # Add a newline after the content for separation
+                output_file.write('\n\n')
+
+print(f"All code files have been concatenated into {output_file_name}.")
+
+
+===== main_bert.py =====
+
+import argparse
+import os
+import random
+import math
+import pickle
+from contextlib import nullcontext
+import yaml
+
+import numpy as np
+import torch
+from torch import nn
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
+from torch.cuda import nvtx
+
+from transformers import BertTokenizer, BertConfig, BertLayer
+
+from pipeline import PipelineStage, PIPELINE_1F1B, PIPELINE_GPIPE, PIPELINE_CHIMERA, PIPELINE_INTER
+from utils import init_dist_process_group
+from bert_optim import BertAdam
+from bert_dataset import BERTDataset
+from bert_model import get_stage_bert_for_pretraining
+import auto_schedule
+from chimera_pipeline_rank import AutoGeneratePipelineRank, MyPipeLine
+
+#import sys
+# sys.stdout.flush()
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
+
+parser = argparse.ArgumentParser()
+# Dataset & BERT
+parser.add_argument("--corpus_path", default=None, type=str, required=True,
+                    help="The input train corpus.")
+parser.add_argument('--corpus_lines', default=None, type=int)
+parser.add_argument("--vocab_path", type=str, required=True)
+parser.add_argument("--on_memory", action='store_true',
+                    help="Whether to load train samples into memory or use disk")
+parser.add_argument("--do_lower_case", action='store_true',
+                    help="Whether to lower case the input text. True for uncased models, False for cased models.")
+parser.add_argument("--bert_config_path", type=str, required=True,
+                    help="config to use.")
+parser.add_argument("--max_seq_length", default=128, type=int,
+                    help="The maximum total input sequence length after WordPiece tokenization. \n"
+                         "Sequences longer than this will be truncated, and sequences shorter \n"
+                         "than this will be padded.")
+# Training
+parser.add_argument("--micro_batch_size", default=32, type=int,
+                    help="Micro-batch size for training.")
+parser.add_argument('--num_optimization_steps', default=None, type=int,
+                    help="Total number of optimization steps to perform.")
+parser.add_argument("--num_epochs", default=None, type=int,
+                    help="Total number of training epochs to perform.")
+parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
+                    help="Number of updates steps to accumulate before performing a backward/update pass.")
+parser.add_argument("--adam_learning_rate", default=3e-5, type=float,
+                    help="The initial learning rate for Adam.")
+parser.add_argument("--adam_max_grad_norm", type=float, default=1.)
+parser.add_argument("--beta1", default=0.9, type=float,
+                    help="beta1 for Adam.")
+parser.add_argument("--weight_decay", type=float, default=0.01)
+parser.add_argument("--warmup_proportion", default=0.1, type=float,
+                    help="Proportion of training to perform linear learning rate warmup for.")
+parser.add_argument("--damping", type=float, default=0.01)
+# Pipeline
+parser.add_argument('--pipeline_method', choices=[
+                    PIPELINE_1F1B, PIPELINE_GPIPE, PIPELINE_CHIMERA, PIPELINE_INTER], default=PIPELINE_1F1B)
+parser.add_argument("--chunks", default=2, type=int,
+                    help="Number of chunks for interleaved 1f1b.")
+parser.add_argument('--recompute', action='store_true',
+                    help='Recompute activations in backward pass')
+parser.add_argument('--num_stages', type=int, default=4,
+                    help='number of stages in configurable BERT model')
+parser.add_argument('--num_pipelines', type=int, default=2,
+                    help='number of pipeline')
+# Others
+parser.add_argument('--checkpoint_dir', default=None, type=str,
+                    help='path to directory to save checkpoints')
+parser.add_argument('--save_checkpoint_steps', type=int, default=200)
+parser.add_argument('--seed', type=int, default=1,
+                    help="random seed for initialization")
+parser.add_argument('--p2p_backend', default=dist.Backend.GLOO, type=str)
+parser.add_argument('--collective_backend',
+                    default=dist.Backend.NCCL, type=str)
+parser.add_argument('--num_workers', default=4, type=int)
+parser.add_argument('--profile', action='store_true')
+
+parser.add_argument('--observe_norm', action='store_true')
+parser.add_argument('--log_interval', type=int, default=100)
+parser.add_argument('--config', type=str, default=None)
+parser.add_argument('--wandb', action='store_true')
+
+
+def main():
+    total_steps = 0
+    for epoch in range(num_epochs):
+        dist.barrier()
+        if num_replicas > 1:
+            # deterministically shuffle based on epoch
+            train_loader.sampler.set_epoch(epoch)
+
+        steps_for_this_epoch = min(
+            num_steps - total_steps, max_steps_per_epoch)
+        train_one_epoch(epoch, total_steps, steps_for_this_epoch)
+        total_steps += steps_for_this_epoch
+
+    if is_master:
+        print('Finished.')
+
+
+def train_one_epoch(epoch, step, num_steps_for_this_epoch):
+
+    num_p2p_comm = num_steps_for_this_epoch * num_micro_batches_per_step
+    if interleaved_pipelines:
+        stage.start_interleaved_pipeline_comm_threads(num_p2p_comm)
+    elif not dual_pipelines:
+        stage.start_comm_threads(num_p2p_comm)
+        stage.stage_module.train()
+    else:
+        for index, s in enumerate(stages):
+            s.start_comm_threads(
+                num_p2p_comm)
+            s.stage_module.train()
+    if interleaved_pipelines:
+        for inter_stage in stage.interleaved_stages:
+            inter_stage.start_interleaved_pipeline_comm_threads(num_p2p_comm)
+            inter_stage.stage_module.train()
+
+    train_iterator = iter(train_loader)
+    train_iterator_for_up_pipe = iter(
+        train_loader_for_up_pipe) if dual_pipelines else None
+
+    save_cxt = nullcontext()
+    save_cxt_up_pipe = nullcontext()
+    with save_cxt as cxt:
+        with save_cxt_up_pipe as cxt_up_pipe:
+
+            for i in range(num_steps_for_this_epoch):
+                for optimizer in optimizers:
+                    optimizer.zero_grad()
+                dist.barrier()
+                loss = stage.call_pipeline(train_iterator,
+                                           num_micro_batches=num_micro_batches_per_step,
+                                           data_iterator_for_up_pipe=train_iterator_for_up_pipe,
+                                           iteration=step+i)
+                for optimizer in optimizers:
+                    optimizer.step()
+
+                if (step+i) % args.log_interval == 0:
+                    loss = torch.tensor(loss, device=stage.device)
+                    dist.reduce(loss, dst=0)
+                    loss /= total_num_micro_batches_per_step
+                    if dual_pipelines:
+                        loss *= 2
+                    if is_master:
+                        print(
+                            f'epoch{epoch+1} step{step+i+1} loss = {float(loss)}')
+                        if args.wandb:
+                            log = {'epoch': epoch+1, 'step': step+i+1, 'loss': float(loss),
+                                   'adam_learning_rate': optimizers[0].get_lr()[0]}
+                            if args.observe_norm:
+                                log['p_norm'] = np.sqrt(
+                                    sum([float(p.data.norm()) ** 2 for p in stage.stage_module.parameters()]))
+                                log['g_norm'] = np.sqrt(
+                                    sum([float(p.grad.norm()) ** 2 for p in stage.stage_module.parameters()]))
+                            wandb.log(log)
+
+                if args.checkpoint_dir is not None and (step+i+1) % args.save_checkpoint_steps == 0 and is_stage_master:
+                    state = {
+                        'epoch': epoch + 1,
+                        'model': stage.stage_module.state_dict(),
+                        'optimizer': optimizers[0].state_dict()
+                    }
+                    assert os.path.isdir(args.checkpoint_dir)
+                    ckpt_file_path = os.path.join(
+                        args.checkpoint_dir, f'epoch{epoch+1}_step{step+i+1}_stage{rank_to_stage(rank)}.pt')
+                    torch.save(state, ckpt_file_path)
+                    print(f'Saved checkpoint to {ckpt_file_path}')
+
+
+if __name__ == "__main__":
+    args = parser.parse_args()
+    dict_args = vars(args)
+    if args.config is not None:
+        dict_args.update(yaml.safe_load(open(args.config, 'r')))
+
+    # Setup rank and device
+    local_rank, local_size, rank, world_size = init_dist_process_group(
+        backend=args.p2p_backend)
+    assert local_size <= torch.cuda.device_count()
+    torch.cuda.set_device(local_rank)
+    device = torch.cuda.current_device()
+    assert world_size > 1
+    is_master = rank == 0
+
+    # Set random seed
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
+
+    num_stages = args.num_stages
+    recompute = args.recompute
+    chunks = args.chunks
+    num_pipelines = args.num_pipelines
+    dual_pipelines = args.pipeline_method == PIPELINE_CHIMERA
+    interleaved_pipelines = args.pipeline_method == PIPELINE_INTER
+    if interleaved_pipelines:
+        assert chunks > 1
+        assert num_stages % chunks == 0
+        assert world_size % (num_stages // chunks) == 0
+    else:
+        assert world_size % num_stages == 0
+
+    num_ranks_per_stage = int(world_size / num_stages)
+    if interleaved_pipelines:
+        num_ranks_per_stage = world_size // (num_stages // chunks)
+    num_replicas = num_ranks_per_stage
+
+    if dual_pipelines:
+        num_replicas *= 2
+    is_distributed = num_replicas > 1
+
+    def rank_to_stage(_rank, down_pipe=True):
+        if down_pipe:
+            return _rank // num_ranks_per_stage
+        else:
+            return (world_size - 1 - _rank) // num_ranks_per_stage
+
+    def rank_to_stages(_rank, down_pipe=True):
+        stages_per_chunk = num_stages // chunks
+        stages = []
+        for _chunk in range(chunks):
+            stages.append(_rank // num_ranks_per_stage +
+                          stages_per_chunk * _chunk)
+        return stages
+
+    stage_to_ranks = {_stage_id: [] for _stage_id in range(num_stages)}
+    num_micro_batches_per_step = num_stages * args.gradient_accumulation_steps
+    if dual_pipelines:
+        num_micro_batches_per_step //= 2  # each pipeline handles half micro_batches
+
+    for _rank in range(world_size):
+        if interleaved_pipelines:
+            stages_per_chunk = num_stages // chunks
+            for _chunk in range(chunks):
+                stage_to_ranks[_rank // num_ranks_per_stage +
+                               _chunk * stages_per_chunk].append(_rank)
+        elif dual_pipelines:
+            # Stage of Chimera
+            pipeline = AutoGeneratePipelineRank(
+                num_stages, num_pipelines, num_micro_batches_per_step*2)
+            pipeline.generate_pipeline()
+            for pipe in pipeline.up_pipline_list:
+                for k, v in pipe.stage_to_rank_map.items():
+                    stage_to_ranks[int(k)].append(*v)
+            for pipe in pipeline.down_pipeline_list:
+                for k, v in pipe.stage_to_rank_map.items():
+                    stage_to_ranks[int(k)].append(*v)
+            break
+        else:
+            stage_to_ranks[rank_to_stage(_rank)].append(_rank)
+    grad_sync_groups = []
+    for _stage_id in range(num_stages):
+        grad_sync_groups.append(dist.new_group(ranks=stage_to_ranks[_stage_id],
+                                               backend=args.collective_backend))
+
+    # Prepare BERT pipeline stages
+    bert_config = BertConfig.from_json_file(args.bert_config_path)
+    micro_batch_size = args.micro_batch_size
+    max_seq_length = args.max_seq_length
+
+    def get_pipeline_stage(down_pipe=True):
+        stage_id = rank_to_stage(rank, down_pipe=down_pipe)
+        stage_module = get_stage_bert_for_pretraining(stage_id,
+                                                      num_stages,
+                                                      bert_config).to(device)
+        rank_interval = num_ranks_per_stage if down_pipe else -num_ranks_per_stage
+        return PipelineStage(stage_id=stage_id,
+                             num_stages=num_stages,
+                             stage_module=stage_module,
+                             batch_sizes=(micro_batch_size, max_seq_length),
+                             pipeline_method=args.pipeline_method,
+                             recompute=recompute,
+                             prev_rank=rank-rank_interval if stage_id > 0 else None,
+                             next_rank=rank+rank_interval if stage_id < num_stages-1 else None,
+                             rank=rank,
+                             grad_sync_group=grad_sync_groups[stage_id],
+                             is_up_pipe=not down_pipe,
+                             pipe_stage=[] if down_pipe and dual_pipelines else None,
+                             interleaved_stages=[],
+                             chunks=chunks,
+                             nvtx_tag='' if down_pipe else auto_schedule.TAG_UP_PIPE)
+
+    def get_interleaved_pipeline_stages(down_pipe=True):
+        stage_ids = rank_to_stages(rank, down_pipe=down_pipe)
+        rank_interval = num_ranks_per_stage if down_pipe else -num_ranks_per_stage
+        stages = []
+        for i, stage_id in enumerate(stage_ids):
+            if i > 0:
+                stage_module = get_stage_bert_for_pretraining(stage_id,
+                                                              num_stages,
+                                                              bert_config).to(device)
+                inter_stage = PipelineStage(stage_id=stage_id,
+                                            num_stages=num_stages,
+                                            stage_module=stage_module,
+                                            batch_sizes=(
+                                                micro_batch_size, max_seq_length),
+                                            pipeline_method=args.pipeline_method,
+                                            recompute=recompute,
+                                            prev_rank=(
+                                                rank-rank_interval+world_size) % world_size if stage_id > 0 else None,
+                                            next_rank=(
+                                                rank+rank_interval) % world_size if stage_id < num_stages-1 else None,
+                                            rank=rank,
+                                            grad_sync_group=grad_sync_groups[stage_id],
+                                            is_up_pipe=not down_pipe,
+                                            pipe_stage=None,
+                                            interleaved_stages=[],
+                                            chunks=chunks,
+                                            nvtx_tag='' if down_pipe else auto_schedule.TAG_UP_PIPE)
+                stages.append(inter_stage)
+
+        first_stage_id = stage_ids[0]
+        stage_module = get_stage_bert_for_pretraining(first_stage_id,
+                                                      num_stages,
+                                                      bert_config).to(device)
+
+        return PipelineStage(stage_id=first_stage_id,
+                             num_stages=num_stages,
+                             stage_module=stage_module,
+                             batch_sizes=(micro_batch_size, max_seq_length),
+                             pipeline_method=args.pipeline_method,
+                             recompute=recompute,
+                             prev_rank=(
+                                 rank-rank_interval+world_size) % world_size if first_stage_id > 0 else None,
+                             next_rank=(
+                                 rank+rank_interval) % world_size if first_stage_id < num_stages-1 else None,
+                             rank=rank,
+                             grad_sync_group=grad_sync_groups[first_stage_id],
+                             is_up_pipe=not down_pipe,
+                             pipe_stage=None,
+                             interleaved_stages=stages,
+                             chunks=chunks,
+                             nvtx_tag='' if down_pipe else auto_schedule.TAG_UP_PIPE)
+
+    stages = []
+
+    if interleaved_pipelines:
+        stage = get_interleaved_pipeline_stages()
+    else:
+        for i in range(num_pipelines//2):
+            stages.append(get_pipeline_stage(False))
+        for i in range(num_pipelines//2):
+            stages.append(get_pipeline_stage(True))
+        for s in stages:
+            s.pipe_stage = stages
+        stage = stages[0]
+
+    is_stage_master = rank % num_ranks_per_stage == 0
+
+    # Prepare BERT dataset
+    tokenizer = BertTokenizer(
+        args.vocab_path, do_lower_case=args.do_lower_case)
+    train_dataset = BERTDataset(args.corpus_path,
+                                tokenizer,
+                                seq_len=max_seq_length,
+                                corpus_lines=args.corpus_lines,
+                                encoding='latin-1',
+                                on_memory=args.on_memory)
+
+    def get_train_loader(down_pipe=True):
+        sampler = None
+        if num_replicas > 1:
+            rank_in_replicas = rank_in_stage = rank % num_ranks_per_stage
+            if dual_pipelines:
+                rank_in_replicas = 2 * rank_in_stage + int(not down_pipe)
+            sampler = DistributedSampler(
+                train_dataset, num_replicas=num_replicas, rank=rank_in_replicas)
+        return DataLoader(train_dataset,
+                          sampler=sampler,
+                          batch_size=micro_batch_size,
+                          drop_last=True,
+                          num_workers=args.num_workers)
+
+    train_loader = get_train_loader()
+    train_loader_for_up_pipe = get_train_loader(
+        down_pipe=False) if dual_pipelines else None
+
+    # Set the number of optimization steps and epochs
+    total_num_micro_batches_per_step = num_replicas * num_micro_batches_per_step
+    total_num_samples_per_step = total_num_micro_batches_per_step * micro_batch_size
+    max_steps_per_epoch = len(train_dataset) // total_num_samples_per_step
+    num_steps = args.num_optimization_steps
+    if num_steps is None:
+        assert args.num_epochs, 'num_optimization_steps or num_epochs needs to be specified.'
+        num_epochs = args.num_epochs
+        num_steps = max_steps_per_epoch * args.num_epochs
+    else:
+        total_num_samples = num_steps * total_num_samples_per_step
+        num_epochs = math.ceil(total_num_samples / len(train_dataset))
+
+    first_half = rank_to_stage(rank) // (num_stages // 2) == 0
+
+    # Prepare natural gradient preconditioners
+
+    # Prepare optimizers
+    def get_optimizer(module):
+        decay_param_group = {'params': [], 'weight_decay': args.weight_decay}
+        no_decay_param_group = {'params': [], 'weight_decay': 0.}
+        for m in module.modules():
+            if isinstance(m, nn.LayerNorm):
+                no_decay_param_group['params'] += list(m.parameters())
+            elif isinstance(m, (nn.Linear, nn.Embedding)):
+                if hasattr(m, 'bias') and m.bias is not None:
+
+                    no_decay_param_group['params'].append(m.bias)
+                decay_param_group['params'].append(m.weight)
+        params = [decay_param_group, no_decay_param_group]
+
+        return BertAdam(params,
+                        lr=args.adam_learning_rate,
+                        b1=args.beta1,
+                        warmup=args.warmup_proportion,
+                        t_total=num_steps,
+                        max_grad_norm=args.adam_max_grad_norm)
+
+    if dual_pipelines:
+        # Chimera needs to optimize multiple pipelines
+        optimizers = []
+        for s in stages:
+            optimizers.append(get_optimizer(s.stage_module))
+    else:
+        optimizers = [get_optimizer(stage.stage_module)]
+
+    if interleaved_pipelines:
+        for inter_stage in stage.interleaved_stages:
+            optimizers.append(get_optimizer(inter_stage.stage_module))
+
+    dist.barrier()
+    if is_master:
+        if args.wandb:
+            wandb.init(entity=os.getenv('WANDB_ENTITY'),
+                       project=os.getenv('WANDB_PROJECT'))
+            wandb.config.update(dict_args)
+        print('============================')
+        print(f'pipeline_method: {args.pipeline_method}')
+        print(f'num_epochs: {num_epochs}')
+        print(f'num_optimization_steps: {num_steps}')
+        print(f'world_size: {world_size}')
+        print(f'num_replica: {num_replicas}')
+        print(f'num_pipeline: {num_pipelines}')
+        print(f'num_micro_batches_per_step: {num_micro_batches_per_step}')
+        print(f'recompute: {recompute}')
+        for _stage_id in range(num_stages):
+            print(f'stage{_stage_id}: ranks {stage_to_ranks[_stage_id]}')
+        print('----------------------------')
+        for key, value in dict_args.items():
+            print(f'{key}: {value}')
+        print('============================')
+
+    if args.profile:
+        with torch.cuda.profiler.profile():
+            main()
+    else:
+        main()
+
+
+===== utils.py =====
+
+import os
+import torch.distributed as dist
+from torch.utils.data import DataLoader
+
+DEFAULT_MASTER_ADDR = '127.0.0.1'
+DEFAULT_MASTER_PORT = '1234'
+
+
+def init_dist_process_group(backend='nccl', is_high_priority=True):
+    if os.environ.get('LOCAL_RANK', None) is not None:
+        local_rank = int(os.environ['LOCAL_RANK'])
+        world_rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_size = int(os.environ['LOCAL_SIZE'])
+    elif os.environ.get('SLURM_JOBID', None) is not None:
+        local_rank = int(os.environ['SLURM_LOCALID'])
+        world_rank = int(os.environ['SLURM_PROCID'])
+        world_size = int(os.environ['SLURM_NTASKS'])
+        local_size = int(os.environ['SLURM_NTASKS_PER_NODE'])
+    else:
+        local_rank = 0
+        world_rank = 0
+        world_size = 1
+        local_size = 1
+
+    if world_size > 1:
+        assert dist.is_available()
+        master_addr = os.environ.get('MASTER_ADDR', DEFAULT_MASTER_ADDR)
+        master_port = os.environ.get('MASTER_PORT', DEFAULT_MASTER_PORT)
+        init_method = 'tcp://' + master_addr + ':' + master_port
+        if backend == 'nccl' and is_high_priority:
+            pg_options = dist.ProcessGroupNCCL.Options(
+                is_high_priority_stream=True)
+        else:
+            pg_options = None
+        print(world_rank)
+        dist.init_process_group(backend,
+                                init_method=init_method,
+                                rank=world_rank,
+                                world_size=world_size,
+                                pg_options=pg_options)
+        assert dist.get_rank() == world_rank
+        assert dist.get_world_size() == world_size
+    return local_rank, local_size, world_rank, world_size
+
+
+def get_data_fetch_fn(loader: DataLoader):
+    fetcher = iter(loader)
+
+    def next_batch():
+        try:
+            return next(fetcher)
+        except StopIteration:
+            return None
+
+    return next_batch
+
+
+===== chimera_pipeline_rank.py =====
+
+
+class AutoGeneratePipelineRank:
+
+    def __init__(self, stage_numbers, divisors, micro_batch_numbers):
+        self.module_to_stage_map = [i for i in range(stage_numbers)]
+        self.stage_numbers = stage_numbers
+        assert divisors % 2 == 0, "pipeline num must be an even number"
+        self.pipeline_numbers = 1 if divisors is None else divisors//2
+        self.micro_batch_numbers = micro_batch_numbers
+        self.push_pipeline_numbers = {
+            "up": 0,
+            "down": 0
+        }
+        self.push_micro_batch = 0
+
+    def generate_pipeline(self):
+        self.up_pipline_list = []
+        self.down_pipeline_list = []
+        for i in range(self.pipeline_numbers):
+            # generate up pipeline
+            micro_num = self.stage_numbers//(2*self.pipeline_numbers)
+            if self.micro_batch_numbers-self.push_micro_batch <= micro_num:
+                micro_num = self.micro_batch_numbers-self.push_micro_batch
+
+            self.push_micro_batch += micro_num
+
+            self.up_pipline_list.append(MyPipeLine(i,
+                                                   micro_num, self.stage_numbers,
+                                                   self.pipeline_numbers, self.module_to_stage_map, True))
+
+            if self.micro_batch_numbers-self.push_micro_batch <= micro_num:
+                micro_num = self.micro_batch_numbers-self.push_micro_batch
+
+            self.push_micro_batch += micro_num
+
+            # generate down pipeline
+            self.down_pipeline_list.append(MyPipeLine(i,
+                                                      micro_num, self.stage_numbers,
+                                                      self.pipeline_numbers, self.module_to_stage_map, False))
+
+    def get_schedule(self, is_iteration=False):
+        schedule = []
+        schedule_up_down = []
+        pipelines = self.up_pipline_list + self.down_pipeline_list
+
+        for i in range(self.stage_numbers):
+            schedule.append(list())
+            schedule_up_down.append(list())
+        has_next_flag = True
+        has_next_sync = 0
+        steps = 0
+        sync_list = [[] for i in range(self.stage_numbers)]
+        while(has_next_flag or has_next_sync != 0):
+            next_flag = False
+            sub_schedule = list("" for _ in range(self.stage_numbers))
+            for index, pipeline in enumerate(pipelines):
+                if pipeline.has_next_pass():
+                    next_data, is_pop, step_direction, up_or_down, is_sync = pipeline.next_pass()
+
+                    for k in next_data.keys():
+                        schedule[next_data[k] %
+                                 self.stage_numbers].append(str(k))
+                        up_or_down_str = str(index)
+                        up_or_down_str += "@down@" if up_or_down else "@up@"
+                        schedule_up_down[next_data[k] %
+                                         self.stage_numbers].append(f"{up_or_down_str}{'f' if step_direction[k] == 1 else 'b'}")
+                        if step_direction.get(pipeline.micro_batch_ids[-1], 1) != 1:
+                            direction = "down"
+                            if pipeline.up_or_down:
+                                direction = "up"
+
+                        sub_schedule[next_data[k] %
+                                     self.stage_numbers] = f"{up_or_down_str}{'f' if step_direction[k] == 1 else 'b'}"
+                    if is_sync and next_data.get(pipeline.micro_batch_ids[-1]) is not None:
+                        has_next_sync += 1
+                        sync_list[next_data[pipeline.micro_batch_ids[-1]] %
+                                  self.stage_numbers].append(f"{up_or_down_str}s")
+                    if is_pop and pipeline.has_next_pass():
+                        micro_num = self.stage_numbers//(2 *
+                                                         self.pipeline_numbers)
+                        if self.micro_batch_numbers-self.push_micro_batch <= micro_num:
+                            micro_num = self.micro_batch_numbers-self.push_micro_batch
+
+                        self.push_micro_batch += micro_num
+                        if micro_num != 0:
+                            if pipeline.up_or_down:
+                                direction = "up"
+                            else:
+                                direction = "down"
+                            pipelines.append(MyPipeLine(self.pipeline_numbers+self.push_pipeline_numbers[direction],
+                                                        micro_num, self.stage_numbers,
+                                                        self.pipeline_numbers, self.module_to_stage_map, pipeline.up_or_down))
+                            self.push_pipeline_numbers[direction] += 1
+
+                    next_flag = True
+            for index, s in enumerate(sub_schedule):
+                if s == "" and len(sync_list[index]) > 0:
+                    sub_schedule[index] = sync_list[index].pop(0)
+                    has_next_sync -= 1
+
+            for i in range(self.stage_numbers):
+                if len(schedule[i]) <= steps:
+                    schedule[i].append(sub_schedule[i])
+                    schedule_up_down[i].append(sub_schedule[i])
+
+            steps += 1
+            has_next_flag = next_flag
+            if is_iteration and has_next_flag:
+                yield sub_schedule
+
+class MyPipeLine:
+    def __init__(self, pipeline_id, micro_batch_numbers,
+                 stage_numbers, pipeline_numbers, module_to_stage_map, up_or_down):
+
+        self.pipeline_id = pipeline_id
+        self.micro_batch_numbers = micro_batch_numbers
+        self.stage_to_rank_map = None
+        self.pipeline_numbers = pipeline_numbers
+        self.stage_numbers = stage_numbers
+        self.module_to_stage_map = module_to_stage_map
+        self.up_or_down = up_or_down
+        self.devices = None
+
+
+        self.steps = -1
+        self.step_direction = dict()
+        self.micro_batch_ids = list()
+        self.micro_batch_device = dict()
+        micro_batch_id = ((self.pipeline_id//2)*self.stage_numbers)
+        micro_batch_id += (0 if self.up_or_down else self.stage_numbers//2)
+        for x in range(self.micro_batch_numbers):
+            self.micro_batch_ids.append(
+                x+(self.pipeline_id % self.pipeline_numbers)*(self.stage_numbers//self.pipeline_numbers//2)+micro_batch_id)
+
+        start_stage_device = (self.pipeline_id % self.pipeline_numbers) * \
+            (self.stage_numbers // self.pipeline_numbers)
+        self.devices = [x for x in self.module_to_stage_map[start_stage_device:] +
+                        self.module_to_stage_map[:start_stage_device]]
+
+        if self.up_or_down is True:
+            # down pipeline
+            self.stage_to_rank_map = {
+                str(index): [device] for index, device in enumerate(self.devices)}
+        else:
+            # up pipeline
+            self.stage_to_rank_map = {
+                str(self.stage_numbers-1-index): [device] for index, device in enumerate(self.devices)}
+
+    def next_pass(self):
+        if self.steps <= (self.micro_batch_numbers-1) * 2:
+            self.steps += 1
+
+        over_back_micro_batch = []
+        for micro_batch in self.micro_batch_device.keys():
+            step = 1 if self.up_or_down else -1
+            if self.step_direction[micro_batch] == 1 and abs(self.micro_batch_device[micro_batch] - (self.stage_to_rank_map["0"][0] + 2*self.stage_numbers)) >= self.stage_numbers-1:
+                self.step_direction[micro_batch] = -1
+            elif self.step_direction[micro_batch] == -1 and self.micro_batch_device[micro_batch] == self.stage_to_rank_map["0"][0] + 2*self.stage_numbers:
+                over_back_micro_batch.append(micro_batch)
+            else:
+                self.micro_batch_device[micro_batch] += step * \
+                    self.step_direction[micro_batch]
+        pop_one = False
+        for micro_batch in over_back_micro_batch:
+            self.micro_batch_device.pop(micro_batch)
+            pop_one = True
+
+        if self.steps % 2 == 0:
+            self.micro_batch_device[self.micro_batch_ids[self.steps //
+                                                         2]] = self.stage_to_rank_map["0"][0] + 2*self.stage_numbers
+            self.step_direction[self.micro_batch_ids[self.steps // 2]] = 1
+        is_sync = True if self.step_direction.get(
+            self.micro_batch_ids[-1]) == -1 else False
+        return self.micro_batch_device, pop_one, self.step_direction, self.up_or_down, is_sync
+
+    def has_next_pass(self):
+        if self.micro_batch_numbers > 0 and (self.steps == -1 or self.micro_batch_device):
+            return True
+        return False
+
+
+# ##########################For testing purposes
+def forward(up_or_down):
+    print(f"forward:{up_or_down}")
+
+
+def backward(up_or_down):
+    print(f"backward:{up_or_down}")
+
+
+if __name__ == "__main__":
+    stage_num = 8
+    pipeline_num = 2
+    micro_num = 8
+    print(
+        f"stage:{stage_num}  pipeline_num:{pipeline_num} micro_num:{micro_num}")
+    pipeline = AutoGeneratePipelineRank(stage_num, pipeline_num, micro_num)
+    pipeline.generate_pipeline()
+    stage_to_ranks = [[] for i in range(stage_num)]
+    for pipe in pipeline.down_pipeline_list:
+        for k, v in pipe.stage_to_rank_map.items():
+            stage_to_ranks[int(k)].append(*v)
+    for pipe in pipeline.up_pipline_list:
+        for k, v in pipe.stage_to_rank_map.items():
+            stage_to_ranks[int(k)].append(*v)
+    s = pipeline.get_schedule(True)
+    for sub_schedule in s:
+        if sub_schedule[0] != '':
+            up_down, forward_backward = sub_schedule[0].split(
+                "@")
+            if forward_backward == 'f':
+                forward(up_down)
+            else:
+                backward(up_down)
+        else:
+            print("")
+    pass
+
+
