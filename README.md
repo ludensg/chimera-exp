@@ -9,7 +9,7 @@ Additionally, the Chimera framework used in these experiments is sourced from th
 
 The [utilities](./utilities/) directory only contains miscellaneous scripts used for particular tasks while working on this project.
 
-
+NOTE: This project also uses the NVidia's Apex library for training.
 ## 1. Comprehensive Experiment Proposal
 
 ### Objective
