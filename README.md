@@ -1,6 +1,12 @@
 # Chimera Framework Experiments
 
-This repository holds two experiments based on the Chimera Bidirectional Pipeline Paper. A main experiment (in the chimera-eval directory), and a prior experimental test to check for an appropriate environment setup.
+This repository holds two experiments based on the Chimera Bidirectional Pipeline Paper. There are two main components:
+
+1. **Main Experiment**: Located in the [chimera-eval](./chimera-eval) directory, this part of the repository contains the comprehensive experiment setup and results.
+2. **Prior Experimental Test**: Located in the [test](./test/) directory, this is a preliminary test conducted to ensure the environment is correctly set up for the main experiment. Details can be found inside.
+
+Additionally, the Chimera framework used in these experiments is sourced from their official repository, but the code in the [Chimera](./Chimera/) directory is changed to work in the HiperGator environment (mainly the using of different storages, the home storage for the code, and the blue storage for I/O). You can find the Chimera framework and its documentation here: [Chimera Repository](https://github.com/Shigangli/Chimera).
+
 
 ## 1. Comprehensive Experiment Proposal
 
