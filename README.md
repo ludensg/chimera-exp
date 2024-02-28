@@ -11,7 +11,7 @@ The [utilities](./utilities/) directory only contains miscellaneous scripts used
 
 NOTES: 
 - This project also uses the NVidia's Apex library for training.
-- Home storage used for code, blue storage for I/O, see [plot_cuda_timeline.sh](./Chimera/scripts/plot_cuda_timeline.sh) and [prof_steps](./Chimera/scripts/prof_steps.sh) for details.
+- Home storage used for code, blue storage for I/O, see [plot_cuda_timeline.sh](./chimera-mods-backup/plot_cuda_timeline.sh) and [prof_steps](./chimera-mods-backup/prof_steps.sh) for details.
 
 ## 1. Simple Preliminary Experiment - [test](./test/)
 
